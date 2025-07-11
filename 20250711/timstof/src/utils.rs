@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, s};
 use std::cmp::Ordering;
 use std::error::Error;
 use timsrust::converters::ConvertableDomain;
@@ -63,6 +63,16 @@ impl TimsTOFData {
         
         merged
     }
+
+    pub fn append(&mut self, other: &mut TimsTOFData) {
+        self.rt_values_min.append(&mut other.rt_values_min);
+        self.mobility_values.append(&mut other.mobility_values);
+        self.mz_values.append(&mut other.mz_values);
+        self.intensity_values.append(&mut other.intensity_values);
+        self.frame_indices.append(&mut other.frame_indices);
+        self.scan_indices.append(&mut other.scan_indices);
+    }
+
     
     pub fn to_dataframe(&self) -> PolarsResult<DataFrame> {
         let all_integers = self.mz_values.iter().all(|&mz| mz.fract() == 0.0);
@@ -832,3 +842,614 @@ pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>,
 }
 
 // ----------------------------- End of moved functions -----------------------------
+
+// Helper functions for MS data processing
+pub fn build_ms1_data(fragment_list: &[Vec<f64>], isotope_range: f64, max_mz: f64) -> MSDataArray {
+    let first_fragment = &fragment_list[0];
+    let charge = first_fragment[1];
+    let precursor_mz = first_fragment[5];
+    
+    let available_range = (max_mz - precursor_mz) * charge;
+    let iso_shift_max = (isotope_range.min(available_range) as i32) + 1;
+    
+    let mut isotope_mz_list: Vec<f64> = (0..iso_shift_max)
+        .map(|iso_shift| precursor_mz + (iso_shift as f64) / charge)
+        .collect();
+    
+    isotope_mz_list = intercept_frags_sort(isotope_mz_list, MS1_ISOTOPE_COUNT);
+    
+    let mut ms1_data = Vec::new();
+    for mz in isotope_mz_list {
+        let row = vec![
+            mz,
+            first_fragment[1],
+            first_fragment[2],
+            first_fragment[3],
+            3.0,
+            first_fragment[5],
+            MS1_TYPE_MARKER,
+            0.0,
+            MS1_FRAGMENT_TYPE,
+        ];
+        ms1_data.push(row);
+    }
+    
+    while ms1_data.len() < MS1_ISOTOPE_COUNT {
+        ms1_data.push(vec![0.0; 9]);
+    }
+    
+    ms1_data
+}
+
+pub fn build_ms2_data(fragment_list: &[Vec<f64>], max_fragment_num: usize) -> MSDataArray {
+    let total_count = max_fragment_num * FRAGMENT_VARIANTS;
+    let fragment_num = fragment_list.len();
+    
+    let mut tripled_fragments = Vec::new();
+    for _ in 0..FRAGMENT_VARIANTS {
+        for fragment in fragment_list {
+            tripled_fragments.push(fragment.clone());
+        }
+    }
+    
+    let total_rows = fragment_num * FRAGMENT_VARIANTS;
+    
+    let mut type_column = vec![0.0; total_rows];
+    for i in fragment_num..(fragment_num * 2) {
+        type_column[i] = -1.0;
+    }
+    for i in (fragment_num * 2)..total_rows {
+        type_column[i] = 1.0;
+    }
+    
+    let window_id_column = vec![0.0; total_rows];
+    
+    let mut variant_type_column = vec![0.0; total_rows];
+    for i in 0..fragment_num {
+        variant_type_column[i] = VARIANT_ORIGINAL;
+    }
+    for i in fragment_num..(fragment_num * 2) {
+        variant_type_column[i] = VARIANT_LIGHT;
+    }
+    for i in (fragment_num * 2)..total_rows {
+        variant_type_column[i] = VARIANT_HEAVY;
+    }
+    
+    let mut complete_data = Vec::new();
+    for i in 0..total_rows {
+        let mut row = tripled_fragments[i].clone();
+        row.push(type_column[i]);
+        row.push(window_id_column[i]);
+        row.push(variant_type_column[i]);
+        complete_data.push(row);
+    }
+    
+    if complete_data.len() >= total_count {
+        complete_data.truncate(total_count);
+    } else {
+        let row_size = if !complete_data.is_empty() { complete_data[0].len() } else { 9 };
+        while complete_data.len() < total_count {
+            complete_data.push(vec![0.0; row_size]);
+        }
+    }
+    
+    complete_data
+}
+
+pub fn build_precursor_info(fragment_list: &[Vec<f64>]) -> Vec<f64> {
+    let first_fragment = &fragment_list[0];
+    vec![
+        first_fragment[7],
+        first_fragment[5],
+        first_fragment[1],
+        first_fragment[6],
+        fragment_list.len() as f64,
+        0.0,
+    ]
+}
+
+pub fn format_ms_data(
+    fragment_list: &[Vec<f64>], 
+    isotope_range: f64, 
+    max_mz: f64, 
+    max_fragment: usize
+) -> (MSDataArray, MSDataArray, Vec<f64>) {
+    let ms1_data = build_ms1_data(fragment_list, isotope_range, max_mz);
+    
+    let fragment_list_subset: Vec<Vec<f64>> = fragment_list.iter()
+        .map(|row| row[..6].to_vec())
+        .collect();
+    
+    let mut ms2_data = build_ms2_data(&fragment_list_subset, max_fragment);
+    
+    let mut ms1_copy = ms1_data.clone();
+    for row in &mut ms1_copy {
+        if row.len() > 8 {
+            row[8] = 5.0;
+        }
+    }
+    
+    ms2_data.extend(ms1_copy);
+    
+    let precursor_info = build_precursor_info(fragment_list);
+    
+    (ms1_data, ms2_data, precursor_info)
+}
+
+pub fn build_lib_matrix(
+    lib_data: &[LibraryRecord],
+    lib_cols: &LibCols,
+    iso_range: f64,
+    mz_max: f64,
+    max_fragment: usize,
+) -> Result<(Vec<Vec<String>>, Vec<MSDataArray>, Vec<MSDataArray>, Vec<Vec<f64>>), Box<dyn Error>> {
+    let precursor_ids: Vec<String> = lib_data.iter()
+        .map(|record| record.transition_group_id.clone())
+        .collect();
+    
+    let precursor_groups = get_precursor_indices(&precursor_ids);
+    
+    let mut all_precursors = Vec::new();
+    let mut all_ms1_data = Vec::new();
+    let mut all_ms2_data = Vec::new();
+    let mut all_precursor_info = Vec::new();
+    
+    for (group_idx, indices) in precursor_groups.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        
+        let first_idx = indices[0];
+        let first_record = &lib_data[first_idx];
+        
+        let precursor_info = vec![
+            first_record.transition_group_id.clone(),
+            first_record.decoy.clone(),
+        ];
+        all_precursors.push(precursor_info);
+        
+        let mut group_fragments = Vec::new();
+        for &idx in indices {
+            let record = &lib_data[idx];
+            
+            let fragment_row = vec![
+                record.product_mz.parse::<f64>().unwrap_or(0.0),
+                record.precursor_charge.parse::<f64>().unwrap_or(0.0),
+                record.fragment_charge.parse::<f64>().unwrap_or(0.0),
+                record.library_intensity.parse::<f64>().unwrap_or(0.0),
+                record.fragment_type.parse::<f64>().unwrap_or(0.0),
+                record.precursor_mz.parse::<f64>().unwrap_or(0.0),
+                record.tr_recalibrated.parse::<f64>().unwrap_or(0.0),
+                record.peptide_sequence.len() as f64,
+                record.decoy.parse::<f64>().unwrap_or(0.0),
+                record.transition_group_id.len() as f64,
+            ];
+            group_fragments.push(fragment_row);
+        }
+        
+        let (ms1, ms2, info) = format_ms_data(&group_fragments, iso_range, mz_max, max_fragment);
+        
+        all_ms1_data.push(ms1);
+        all_ms2_data.push(ms2);
+        all_precursor_info.push(info);
+    }
+    
+    Ok((all_precursors, all_ms1_data, all_ms2_data, all_precursor_info))
+}
+
+pub fn build_precursors_matrix_step1(
+    ms1_data_list: &[MSDataArray], 
+    ms2_data_list: &[MSDataArray], 
+    device: &str
+) -> Result<(Array3<f32>, Array3<f32>), Box<dyn Error>> {
+    if ms1_data_list.is_empty() || ms2_data_list.is_empty() {
+        return Err("MS1或MS2数据列表为空".into());
+    }
+    
+    let batch_size = ms1_data_list.len();
+    let ms1_rows = ms1_data_list[0].len();
+    let ms1_cols = if !ms1_data_list[0].is_empty() { ms1_data_list[0][0].len() } else { 0 };
+    let ms2_rows = ms2_data_list[0].len();
+    let ms2_cols = if !ms2_data_list[0].is_empty() { ms2_data_list[0][0].len() } else { 0 };
+    
+    let mut ms1_tensor = Array3::<f32>::zeros((batch_size, ms1_rows, ms1_cols));
+    for (i, ms1_data) in ms1_data_list.iter().enumerate() {
+        for (j, row) in ms1_data.iter().enumerate() {
+            for (k, &val) in row.iter().enumerate() {
+                ms1_tensor[[i, j, k]] = val as f32;
+            }
+        }
+    }
+    
+    let mut ms2_tensor = Array3::<f32>::zeros((batch_size, ms2_rows, ms2_cols));
+    for (i, ms2_data) in ms2_data_list.iter().enumerate() {
+        for (j, row) in ms2_data.iter().enumerate() {
+            for (k, &val) in row.iter().enumerate() {
+                ms2_tensor[[i, j, k]] = val as f32;
+            }
+        }
+    }
+    
+    Ok((ms1_tensor, ms2_tensor))
+}
+
+pub fn build_precursors_matrix_step2(mut ms2_data_tensor: Array3<f32>) -> Array3<f32> {
+    let shape = ms2_data_tensor.shape();
+    let (batch, rows, cols) = (shape[0], shape[1], shape[2]);
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            if cols > 6 {
+                let val0 = ms2_data_tensor[[i, j, 0]];
+                let val6 = ms2_data_tensor[[i, j, 6]];
+                let val2 = ms2_data_tensor[[i, j, 2]];
+                
+                if val2 != 0.0 {
+                    ms2_data_tensor[[i, j, 0]] = val0 + val6 / val2;
+                }
+            }
+        }
+    }
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            for k in 0..cols {
+                let val = ms2_data_tensor[[i, j, k]];
+                if val.is_infinite() || val.is_nan() {
+                    ms2_data_tensor[[i, j, k]] = 0.0;
+                }
+            }
+        }
+    }
+    
+    ms2_data_tensor
+}
+
+pub fn extract_width_2(
+    mz_to_extract: &Array3<f32>,
+    mz_unit: &str,
+    mz_tol: f32,
+    max_extract_len: usize,
+    frag_repeat_num: usize,
+    max_moz_num: f32,
+    device: &str
+) -> Result<Array3<f32>, Box<dyn Error>> {
+    let shape = mz_to_extract.shape();
+    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
+    
+    let is_all_zero = mz_to_extract.iter().all(|&v| v == 0.0);
+    if is_all_zero {
+        return Ok(Array3::<f32>::zeros((batch, rows, 2)));
+    }
+    
+    let mut mz_tol_full = Array3::<f32>::zeros((batch, rows, 1));
+    
+    match mz_unit {
+        "Da" => {
+            for i in 0..batch {
+                for j in 0..rows {
+                    mz_tol_full[[i, j, 0]] = mz_tol;
+                }
+            }
+        },
+        "ppm" => {
+            for i in 0..batch {
+                for j in 0..rows {
+                    mz_tol_full[[i, j, 0]] = mz_to_extract[[i, j, 0]] * mz_tol * 0.000001;
+                }
+            }
+        },
+        _ => return Err(format!("Invalid mz_unit format: {}. Only Da and ppm are supported.", mz_unit).into()),
+    }
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            if mz_tol_full[[i, j, 0]].is_nan() {
+                mz_tol_full[[i, j, 0]] = 0.0;
+            }
+        }
+    }
+    
+    let mz_tol_full_num = max_moz_num / 1000.0;
+    for i in 0..batch {
+        for j in 0..rows {
+            if mz_tol_full[[i, j, 0]] > mz_tol_full_num {
+                mz_tol_full[[i, j, 0]] = mz_tol_full_num;
+            }
+        }
+    }
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            let val = mz_tol_full[[i, j, 0]];
+            mz_tol_full[[i, j, 0]] = ((val * 1000.0 / frag_repeat_num as f32).ceil()) * frag_repeat_num as f32;
+        }
+    }
+    
+    let mut extract_width_range_list = Array3::<f32>::zeros((batch, rows, 2));
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            let mz_val = mz_to_extract[[i, j, 0]] * 1000.0;
+            let tol_val = mz_tol_full[[i, j, 0]];
+            extract_width_range_list[[i, j, 0]] = (mz_val - tol_val).floor();
+            extract_width_range_list[[i, j, 1]] = (mz_val + tol_val).floor();
+        }
+    }
+    
+    Ok(extract_width_range_list)
+}
+
+pub fn build_range_matrix_step3(
+    ms1_data_tensor: &Array3<f32>,
+    ms2_data_tensor: &Array3<f32>,
+    frag_repeat_num: usize,
+    mz_unit: &str,
+    mz_tol_ms1: f32,
+    mz_tol_ms2: f32,
+    device: &str
+) -> Result<(Array3<f32>, Array3<f32>), Box<dyn Error>> {
+    let shape1 = ms1_data_tensor.shape();
+    let shape2 = ms2_data_tensor.shape();
+    
+    let mut re_ms1_data_tensor = Array3::<f32>::zeros((shape1[0], shape1[1] * frag_repeat_num, shape1[2]));
+    let mut re_ms2_data_tensor = Array3::<f32>::zeros((shape2[0], shape2[1] * frag_repeat_num, shape2[2]));
+    
+    for i in 0..shape1[0] {
+        for rep in 0..frag_repeat_num {
+            for j in 0..shape1[1] {
+                for k in 0..shape1[2] {
+                    re_ms1_data_tensor[[i, rep * shape1[1] + j, k]] = ms1_data_tensor[[i, j, k]];
+                }
+            }
+        }
+    }
+    
+    for i in 0..shape2[0] {
+        for rep in 0..frag_repeat_num {
+            for j in 0..shape2[1] {
+                for k in 0..shape2[2] {
+                    re_ms2_data_tensor[[i, rep * shape2[1] + j, k]] = ms2_data_tensor[[i, j, k]];
+                }
+            }
+        }
+    }
+    
+    let ms1_col0 = re_ms1_data_tensor.slice(s![.., .., 0..1]).to_owned();
+    let ms2_col0 = re_ms2_data_tensor.slice(s![.., .., 0..1]).to_owned();
+    
+    let ms1_extract_width_range_list = extract_width_2(
+        &ms1_col0, mz_unit, mz_tol_ms1, 20, frag_repeat_num, 50.0, device
+    )?;
+    
+    let ms2_extract_width_range_list = extract_width_2(
+        &ms2_col0, mz_unit, mz_tol_ms2, 20, frag_repeat_num, 50.0, device
+    )?;
+    
+    Ok((ms1_extract_width_range_list, ms2_extract_width_range_list))
+}
+
+pub fn extract_width(
+    mz_to_extract: &Array3<f32>,
+    mz_unit: &str,
+    mz_tol: f32,
+    max_extract_len: usize,
+    frag_repeat_num: usize,
+    max_moz_num: f32,
+    device: &str
+) -> Result<Array3<f32>, Box<dyn Error>> {
+    let shape = mz_to_extract.shape();
+    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
+    
+    let is_all_zero = mz_to_extract.iter().all(|&v| v == 0.0);
+    if is_all_zero {
+        return Ok(Array3::<f32>::zeros((batch, rows, max_moz_num as usize)));
+    }
+    
+    let mut mz_tol_half = Array3::<f32>::zeros((batch, rows, 1));
+    
+    match mz_unit {
+        "Da" => {
+            for i in 0..batch {
+                for j in 0..rows {
+                    mz_tol_half[[i, j, 0]] = mz_tol / 2.0;
+                }
+            }
+        },
+        "ppm" => {
+            for i in 0..batch {
+                for j in 0..rows {
+                    mz_tol_half[[i, j, 0]] = mz_to_extract[[i, j, 0]] * mz_tol * 0.000001 / 2.0;
+                }
+            }
+        },
+        _ => return Err(format!("Invalid mz_unit format: {}. Only Da and ppm are supported.", mz_unit).into()),
+    }
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            if mz_tol_half[[i, j, 0]].is_nan() {
+                mz_tol_half[[i, j, 0]] = 0.0;
+            }
+        }
+    }
+    
+    let mz_tol_half_num = (max_moz_num / 1000.0) / 2.0;
+    for i in 0..batch {
+        for j in 0..rows {
+            if mz_tol_half[[i, j, 0]] > mz_tol_half_num {
+                mz_tol_half[[i, j, 0]] = mz_tol_half_num;
+            }
+        }
+    }
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            let val = mz_tol_half[[i, j, 0]];
+            mz_tol_half[[i, j, 0]] = ((val * 1000.0 / frag_repeat_num as f32).ceil()) * frag_repeat_num as f32;
+        }
+    }
+    
+    let mut extract_width_list = Array3::<f32>::zeros((batch, rows, 2));
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            let mz_val = mz_to_extract[[i, j, 0]] * 1000.0;
+            let tol_val = mz_tol_half[[i, j, 0]];
+            extract_width_list[[i, j, 0]] = (mz_val - tol_val).floor();
+            extract_width_list[[i, j, 1]] = (mz_val + tol_val).floor();
+        }
+    }
+    
+    let batch_num = rows / frag_repeat_num;
+    
+    let mut cha_tensor = Array2::<f32>::zeros((batch, batch_num));
+    for i in 0..batch {
+        for j in 0..batch_num {
+            cha_tensor[[i, j]] = (extract_width_list[[i, j, 1]] - extract_width_list[[i, j, 0]]) / frag_repeat_num as f32;
+        }
+    }
+    
+    for i in 0..batch {
+        for j in 0..batch_num {
+            extract_width_list[[i, j, 1]] = extract_width_list[[i, j, 0]] + cha_tensor[[i, j]] - 1.0;
+        }
+        
+        for j in 0..batch_num {
+            let idx = batch_num + j;
+            if idx < rows {
+                extract_width_list[[i, idx, 0]] = extract_width_list[[i, j, 0]] + cha_tensor[[i, j]];
+                extract_width_list[[i, idx, 1]] = extract_width_list[[i, j, 0]] + 2.0 * cha_tensor[[i, j]] - 1.0;
+            }
+        }
+        
+        for j in 0..batch_num {
+            let idx = batch_num * 2 + j;
+            if idx < rows {
+                extract_width_list[[i, idx, 0]] = extract_width_list[[i, j, 0]] + 2.0 * cha_tensor[[i, j]];
+                extract_width_list[[i, idx, 1]] = extract_width_list[[i, j, 0]] + 3.0 * cha_tensor[[i, j]] - 1.0;
+            }
+        }
+        
+        for j in 0..batch_num {
+            let idx = batch_num * 3 + j;
+            if idx < rows {
+                extract_width_list[[i, idx, 0]] = extract_width_list[[i, j, 0]] + 3.0 * cha_tensor[[i, j]];
+                extract_width_list[[i, idx, 1]] = extract_width_list[[i, j, 0]] + 4.0 * cha_tensor[[i, j]] - 1.0;
+            }
+        }
+        
+        for j in 0..batch_num {
+            let idx = batch_num * 4 + j;
+            if idx < rows {
+                extract_width_list[[i, idx, 0]] = extract_width_list[[i, j, 0]] + 4.0 * cha_tensor[[i, j]];
+                extract_width_list[[i, idx, 1]] = extract_width_list[[i, j, 0]] + 5.0 * cha_tensor[[i, j]] - 1.0;
+            }
+        }
+    }
+    
+    let mut new_tensor = Array3::<f32>::zeros((batch, rows, max_moz_num as usize));
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            for k in 0..(max_moz_num as usize) {
+                new_tensor[[i, j, k]] = extract_width_list[[i, j, 0]] + k as f32;
+                if new_tensor[[i, j, k]] > extract_width_list[[i, j, 1]] {
+                    new_tensor[[i, j, k]] = 0.0;
+                }
+            }
+        }
+    }
+    
+    Ok(new_tensor)
+}
+
+pub fn build_precursors_matrix_step3(
+    ms1_data_tensor: &Array3<f32>,
+    ms2_data_tensor: &Array3<f32>,
+    frag_repeat_num: usize,
+    mz_unit: &str,
+    mz_tol_ms1: f32,
+    mz_tol_ms2: f32,
+    device: &str
+) -> Result<(Array3<f32>, Array3<f32>, Array3<f32>, Array3<f32>), Box<dyn Error>> {
+    let shape1 = ms1_data_tensor.shape();
+    let shape2 = ms2_data_tensor.shape();
+    
+    let mut re_ms1_data_tensor = Array3::<f32>::zeros((shape1[0], shape1[1] * frag_repeat_num, shape1[2]));
+    let mut re_ms2_data_tensor = Array3::<f32>::zeros((shape2[0], shape2[1] * frag_repeat_num, shape2[2]));
+    
+    for i in 0..shape1[0] {
+        for rep in 0..frag_repeat_num {
+            for j in 0..shape1[1] {
+                for k in 0..shape1[2] {
+                    re_ms1_data_tensor[[i, rep * shape1[1] + j, k]] = ms1_data_tensor[[i, j, k]];
+                }
+            }
+        }
+    }
+    
+    for i in 0..shape2[0] {
+        for rep in 0..frag_repeat_num {
+            for j in 0..shape2[1] {
+                for k in 0..shape2[2] {
+                    re_ms2_data_tensor[[i, rep * shape2[1] + j, k]] = ms2_data_tensor[[i, j, k]];
+                }
+            }
+        }
+    }
+    
+    let ms1_col0 = re_ms1_data_tensor.slice(s![.., .., 0..1]).to_owned();
+    let ms2_col0 = re_ms2_data_tensor.slice(s![.., .., 0..1]).to_owned();
+    
+    let ms1_extract_width_range_list = extract_width(
+        &ms1_col0, mz_unit, mz_tol_ms1, 20, frag_repeat_num, 50.0, device
+    )?;
+    
+    let ms2_extract_width_range_list = extract_width(
+        &ms2_col0, mz_unit, mz_tol_ms2, 20, frag_repeat_num, 50.0, device
+    )?;
+    
+    Ok((re_ms1_data_tensor, re_ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list))
+}
+
+pub fn build_frag_info(
+    ms1_data_tensor: &Array3<f32>,
+    ms2_data_tensor: &Array3<f32>,
+    frag_repeat_num: usize,
+    device: &str
+) -> Array3<f32> {
+    let ext_ms1_precursors_frag_rt_matrix = build_ext_ms1_matrix(ms1_data_tensor, device);
+    let ext_ms2_precursors_frag_rt_matrix = build_ext_ms2_matrix(ms2_data_tensor, device);
+    
+    let ms1_shape = ext_ms1_precursors_frag_rt_matrix.shape().to_vec();
+    let ms2_shape = ext_ms2_precursors_frag_rt_matrix.shape().to_vec();
+    
+    let batch = ms1_shape[0];
+    let ms1_rows = ms1_shape[1];
+    let ms2_rows = ms2_shape[1];
+    
+    let orig_ms1_shape = ms1_data_tensor.shape();
+    let orig_ms2_shape = ms2_data_tensor.shape();
+    let ms1_frag_count = orig_ms1_shape[1];
+    let ms2_frag_count = orig_ms2_shape[1];
+    
+    let total_frag_count = ms1_frag_count + ms2_frag_count;
+    let mut frag_info = Array3::<f32>::zeros((batch, total_frag_count, 4));
+    
+    for i in 0..batch {
+        for j in 0..ms1_frag_count {
+            for k in 0..4 {
+                frag_info[[i, j, k]] = ext_ms1_precursors_frag_rt_matrix[[i, j, k]];
+            }
+        }
+        
+        for j in 0..ms2_frag_count {
+            for k in 0..4 {
+                frag_info[[i, ms1_frag_count + j, k]] = ext_ms2_precursors_frag_rt_matrix[[i, j, k]];
+            }
+        }
+    }
+    
+    frag_info
+}

@@ -25,6 +25,9 @@ ndarray-rand = "0.14"
 plotters = "0.3"
 plotters-backend = "0.3"
 ordered-float = "5.0.0"
+clap = { version = "4.0", features = ["derive"] }
+env = "1.0.1"
+num_cpus = "1.16"
 
 [profile.release]
 lto = true

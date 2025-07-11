@@ -3,6 +3,7 @@ mod utils;
 use std::fs::File;
 use std::error::Error;
 use std::time::Instant;
+use std::io::Write;
 use rayon::prelude::*;
 use csv::{ReaderBuilder, Writer};
 use polars::prelude::*;
@@ -12,10 +13,197 @@ use std::f64::{INFINITY, NAN};
 use timsrust::readers::{FrameReader, MetadataReader};
 use timsrust::converters::ConvertableDomain;
 use timsrust::MSLevel;
-use std::io::Write;
 use std::path::Path;
+use serde_json::json;
 
 use utils::*;
+
+// Helper function to save Vec<Vec<String>> to JSON
+fn save_precursors_list_to_json(precursors: &[Vec<String>], path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "precursors": precursors,
+        "count": precursors.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Vec<Vec<Vec<f64>>> to JSON (3D vector)
+fn save_ms_data_list_to_json(ms_data: &[Vec<Vec<f64>>], path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "ms_data": ms_data,
+        "count": ms_data.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Vec<Vec<f64>> to JSON
+fn save_precursor_info_to_json(precursor_info: &[Vec<f64>], path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "precursor_info": precursor_info,
+        "count": precursor_info.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save HashMap<String, f64> to JSON
+fn save_dict_to_json(dict: &HashMap<String, f64>, path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "dict": dict,
+        "count": dict.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Array4 to JSON
+fn save_array4_to_json(array: &Array4<f32>, path: &str) -> Result<(), Box<dyn Error>> {
+    let shape = array.shape();
+    let data: Vec<Vec<Vec<Vec<f32>>>> = (0..shape[0])
+        .map(|i| (0..shape[1]).map(|j| 
+            (0..shape[2]).map(|k| 
+                (0..shape[3]).map(|l| array[[i, j, k, l]]).collect()
+            ).collect()
+        ).collect())
+        .collect();
+    
+    let json_data = json!({
+        "shape": shape,
+        "data": data
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save precursor feature matrix to JSON
+fn save_precursor_feat_to_json(array: &Array2<f64>, path: &str) -> Result<(), Box<dyn Error>> {
+    let shape = array.shape();
+    let data: Vec<Vec<f64>> = (0..shape[0])
+        .map(|i| (0..shape[1]).map(|j| array[[i, j]]).collect())
+        .collect();
+    
+    let json_data = json!({
+        "shape": shape,
+        "data": data
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save TimsTOFData to JSON
+fn save_timstof_data_to_json(data: &TimsTOFData, path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "rt_values_min": data.rt_values_min,
+        "mobility_values": data.mobility_values,
+        "mz_values": data.mz_values,
+        "intensity_values": data.intensity_values,
+        "frame_indices": data.frame_indices,
+        "scan_indices": data.scan_indices,
+        "length": data.mz_values.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Array2 to JSON
+fn save_array2_to_json(array: &Array2<f32>, path: &str) -> Result<(), Box<dyn Error>> {
+    let shape = array.shape();
+    let data: Vec<Vec<f32>> = (0..shape[0])
+        .map(|i| (0..shape[1]).map(|j| array[[i, j]]).collect())
+        .collect();
+    
+    let json_data = json!({
+        "shape": shape,
+        "data": data
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Array3 to JSON
+fn save_array3_to_json(array: &Array3<f32>, path: &str) -> Result<(), Box<dyn Error>> {
+    let shape = array.shape();
+    let data: Vec<Vec<Vec<f32>>> = (0..shape[0])
+        .map(|i| (0..shape[1]).map(|j| 
+            (0..shape[2]).map(|k| array[[i, j, k]]).collect()
+        ).collect())
+        .collect();
+    
+    let json_data = json!({
+        "shape": shape,
+        "data": data
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save Vec<f64> to JSON
+fn save_vec_f64_to_json(vec: &Vec<f64>, path: &str) -> Result<(), Box<dyn Error>> {
+    let json_data = json!({
+        "data": vec,
+        "length": vec.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
+
+// Helper function to save library records to JSON
+fn save_library_records_to_json(records: &[utils::LibraryRecord], path: &str) -> Result<(), Box<dyn Error>> {
+    let json_records: Vec<_> = records.iter().map(|record| {
+        json!({
+            "transition_group_id": record.transition_group_id,
+            "decoy": record.decoy,
+            "product_mz": record.product_mz,
+            "precursor_mz": record.precursor_mz,
+            "tr_recalibrated": record.tr_recalibrated,
+            "library_intensity": record.library_intensity,
+            "fragment_type": record.fragment_type,
+            "fragment_series_number": record.fragment_number
+        })
+    }).collect();
+    
+    let json_data = json!({
+        "records": json_records,
+        "count": records.len()
+    });
+    
+    std::fs::create_dir_all(Path::new(path).parent().unwrap())?;
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&json_data)?.as_bytes())?;
+    Ok(())
+}
 
 fn read_timstof_data(bruker_d_folder_path: &str) -> Result<TimsTOFData, Box<dyn Error>> {
     let tdf_path = Path::new(bruker_d_folder_path).join("analysis.tdf");
@@ -382,6 +570,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("启动程序...");
     let program_start = Instant::now();
     
+    // Create output directory
+    let output_dir = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/20250711/rust_comparison_results";
+    std::fs::create_dir_all(output_dir)?;
+    
     // 读取库文件
     println!("\n步骤1: 读取库文件");
     let lib_file_path = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/helper/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
@@ -418,11 +610,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     
+    // OUTPUT STEP 0: Save each_lib_data (library records for precursor)
+    save_library_records_to_json(&each_lib_data, &format!("{}/old_version_step0_each_lib_data.json", output_dir))?;
+    
     // 构建库矩阵
     println!("\n步骤8: 构建库矩阵");
     let lib_cols = LibCols::default();
     let (precursors_list, ms1_data_list, ms2_data_list, precursor_info_list) = 
         build_lib_matrix(&each_lib_data, &lib_cols, 5.0, 1801.0, 20)?;
+    
+    // OUTPUT STEP 0A: Save build_lib_matrix results
+    save_precursors_list_to_json(&precursors_list, &format!("{}/old_version_step0a_precursors_list.json", output_dir))?;
+    save_ms_data_list_to_json(&ms1_data_list, &format!("{}/old_version_step0a_ms1_data_list.json", output_dir))?;
+    save_ms_data_list_to_json(&ms2_data_list, &format!("{}/old_version_step0a_ms2_data_list.json", output_dir))?;
+    save_precursor_info_to_json(&precursor_info_list, &format!("{}/old_version_step0a_precursor_info_list.json", output_dir))?;
     
     // 构建前体特征矩阵
     println!("\n步骤9: 构建前体特征矩阵");
@@ -433,13 +634,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         &assay_im_kept_dict
     )?;
     
+    // OUTPUT STEP 0F: Save precursor metadata
+    save_dict_to_json(&assay_rt_kept_dict, &format!("{}/old_version_step0f_assay_rt_kept_dict.json", output_dir))?;
+    save_dict_to_json(&assay_im_kept_dict, &format!("{}/old_version_step0f_assay_im_kept_dict.json", output_dir))?;
+    
+    // OUTPUT STEP 0G: Save precursor feature matrix
+    save_precursor_feat_to_json(&precursor_feat, &format!("{}/old_version_step0g_precursor_feat.json", output_dir))?;
+    
     // 构建张量
     println!("\n步骤10: 构建张量");
     let device = "cpu";
     let frag_repeat_num = 5;
     
     let (ms1_tensor, ms2_tensor) = build_precursors_matrix_step1(&ms1_data_list, &ms2_data_list, device)?;
+    
+    // OUTPUT STEP 0B: Save tensor step 1 results
+    save_array3_to_json(&ms1_tensor, &format!("{}/old_version_step0b_ms1_tensor_step1.json", output_dir))?;
+    save_array3_to_json(&ms2_tensor, &format!("{}/old_version_step0b_ms2_tensor_step1.json", output_dir))?;
+    
     let ms2_tensor_processed = build_precursors_matrix_step2(ms2_tensor);
+    
+    // OUTPUT STEP 0C: Save tensor step 2 results
+    save_array3_to_json(&ms2_tensor_processed, &format!("{}/old_version_step0c_ms2_tensor_step2.json", output_dir))?;
+    
     let (ms1_range_list, ms2_range_list) = build_range_matrix_step3(
         &ms1_tensor, 
         &ms2_tensor_processed, 
@@ -449,6 +666,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         50.0,
         device
     )?;
+    
+    // OUTPUT STEP 0D: Save range matrices
+    save_array3_to_json(&ms1_range_list, &format!("{}/old_version_step0d_ms1_range_list.json", output_dir))?;
+    save_array3_to_json(&ms2_range_list, &format!("{}/old_version_step0d_ms2_range_list.json", output_dir))?;
+    
     let (re_ms1_tensor, re_ms2_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list) = 
         build_precursors_matrix_step3(
             &ms1_tensor,
@@ -459,6 +681,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             50.0,
             device
         )?;
+    
+    // OUTPUT STEP 0E: Save extract width range lists
+    save_array3_to_json(&ms1_extract_width_range_list, &format!("{}/old_version_step0e_ms1_extract_width_range_list.json", output_dir))?;
+    save_array3_to_json(&ms2_extract_width_range_list, &format!("{}/old_version_step0e_ms2_extract_width_range_list.json", output_dir))?;
+    
     let frag_info = build_frag_info(
         &ms1_tensor,
         &ms2_tensor_processed,
@@ -466,10 +693,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         device
     );
     
+    // OUTPUT STEP 0H: Save fragment info
+    println!("✓ Fragment info shape: {:?}", frag_info.shape());
+    save_array3_to_json(&frag_info, &format!("{}/old_version_step0h_frag_info.json", output_dir))?;
+    
     // 读取TimsTOF数据
     println!("\n步骤11: 读取TimsTOF数据");
     let bruker_d_folder_name = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
     let timstof_data = read_timstof_data(bruker_d_folder_name)?;
+    
+    // OUTPUT STEP 0I: Save TimsTOF data summary
+    let timstof_summary = json!({
+        "ms1_peaks_count": timstof_data.mz_values.len(),
+        "ms1_sample_data": {
+            "rt_values_min": timstof_data.rt_values_min.iter().take(10).collect::<Vec<_>>(),
+            "mobility_values": timstof_data.mobility_values.iter().take(10).collect::<Vec<_>>(),
+            "mz_values": timstof_data.mz_values.iter().take(10).collect::<Vec<_>>(),
+            "intensity_values": timstof_data.intensity_values.iter().take(10).collect::<Vec<_>>()
+        }
+    });
+    let mut file = File::create(format!("{}/old_version_step0i_timstof_summary.json", output_dir))?;
+    file.write_all(serde_json::to_string_pretty(&timstof_summary)?.as_bytes())?;
     
     // 处理前体数据
     println!("\n步骤12: 处理前体数据");
@@ -488,15 +732,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ms1_range_min = (min_val - 1.0) / 1000.0;
     let ms1_range_max = (max_val + 1.0) / 1000.0;
     
+    // OUTPUT STEP 0J: Save m/z range calculation details
+    let mz_range_details = json!({
+        "precursor_index": i,
+        "im": im,
+        "rt": rt,
+        "min_val": min_val,
+        "max_val": max_val,
+        "ms1_range_min": ms1_range_min,
+        "ms1_range_max": ms1_range_max,
+        "ms1_range_slice_sample": ms1_range_slice.slice(s![..3, ..]).to_owned().into_raw_vec(),
+        "ms1_range_slice_shape": ms1_range_slice.shape().to_vec()
+    });
+    let mut file = File::create(format!("{}/old_version_step0j_mz_range_details.json", output_dir))?;
+    file.write_all(serde_json::to_string_pretty(&mz_range_details)?.as_bytes())?;
+    
     // 筛选和处理MS1数据
     let precursor_result = timstof_data.filter_by_mz_range(ms1_range_min, ms1_range_max);
+    
+    // OUTPUT STEP 1: Save MS1 precursor result
+    save_timstof_data_to_json(&precursor_result, &format!("{}/old_version_step1_precursor_result.json", output_dir))?;
+    
     let precursor_result_int = convert_mz_to_integer(&precursor_result);
+    
+    // OUTPUT STEP 2: Save MS1 integer converted result
+    save_timstof_data_to_json(&precursor_result_int, &format!("{}/old_version_step2_precursor_result_int.json", output_dir))?;
     
     // IM过滤
     let im_tolerance = 0.05;
     let im_min = im - im_tolerance;
     let im_max = im + im_tolerance;
     let filtered_result = filter_by_im_range(&precursor_result_int, im_min, im_max);
+    
+    // OUTPUT STEP 3: Save MS1 IM filtered result
+    save_timstof_data_to_json(&filtered_result, &format!("{}/old_version_step3_precursor_result_filtered.json", output_dir))?;
     
     // 读取完整MS数据
     println!("\n步骤13: 读取完整MS数据");
@@ -519,8 +788,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // 处理MS2数据
     let merged_frag_data = TimsTOFData::merge(frag_results);
+    
+    // OUTPUT STEP 4: Save MS2 merged result
+    save_timstof_data_to_json(&merged_frag_data, &format!("{}/old_version_step4_merged_frag_result.json", output_dir))?;
+    
     let merged_frag_data_int = convert_mz_to_integer(&merged_frag_data);
     let filtered_frag_data = filter_by_im_range(&merged_frag_data_int, im_min, im_max);
+    
+    // OUTPUT STEP 5: Save MS2 filtered result
+    save_timstof_data_to_json(&filtered_frag_data, &format!("{}/old_version_step5_frag_result_filtered.json", output_dir))?;
     
     // 构建Mask矩阵
     println!("\n步骤15: 构建Mask矩阵");
@@ -557,6 +833,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     
+    // OUTPUT STEP 6: Save mask matrices
+    save_array2_to_json(&ms1_frag_moz_matrix, &format!("{}/old_version_step6_ms1_mask_matrix.json", output_dir))?;
+    save_array2_to_json(&ms2_frag_moz_matrix, &format!("{}/old_version_step6_ms2_mask_matrix.json", output_dir))?;
+    
     // 构建强度矩阵
     println!("\n步骤16: 构建强度矩阵");
     let mut all_rt_set = HashSet::new();
@@ -577,6 +857,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rt_value = precursor_feat[[i, 6]];
     let all_rt = get_rt_list(all_rt_vec, rt_value);
     
+    // OUTPUT STEP 7: Save RT list
+    save_vec_f64_to_json(&all_rt, &format!("{}/old_version_step7_rt_list.json", output_dir))?;
+    
     let ms1_frag_rt_matrix = build_intensity_matrix_optimized_parallel(
         &filtered_result,
         &ms1_extract_width_range_list.slice(s![i, .., ..]).to_owned(),
@@ -590,6 +873,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         &ms2_frag_moz_matrix,
         &all_rt,
     )?;
+    
+    // OUTPUT STEP 8: Save intensity matrices
+    save_array2_to_json(&ms1_frag_rt_matrix, &format!("{}/old_version_step8_ms1_intensity_matrix.json", output_dir))?;
+    save_array2_to_json(&ms2_frag_rt_matrix, &format!("{}/old_version_step8_ms2_intensity_matrix.json", output_dir))?;
     
     // 重塑和合并矩阵
     println!("\n步骤17: 重塑和合并矩阵");
@@ -612,6 +899,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ms2_rows / frag_repeat_num,
         ms2_cols
     ))?;
+    
+    // OUTPUT STEP 9: Save reshaped matrices
+    save_array3_to_json(&ms1_reshaped, &format!("{}/old_version_step9_ms1_reshaped.json", output_dir))?;
+    save_array3_to_json(&ms2_reshaped, &format!("{}/old_version_step9_ms2_reshaped.json", output_dir))?;
     
     let ms1_frags = ms1_reshaped.shape()[1];
     let ms2_frags = ms2_reshaped.shape()[1];
@@ -636,10 +927,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     
+    // OUTPUT STEP 10: Save combined matrix
+    save_array3_to_json(&full_frag_rt_matrix, &format!("{}/old_version_step10_combined_matrix.json", output_dir))?;
+    
     let rsm_matrix = full_frag_rt_matrix.insert_axis(Axis(0));
     
     // 创建最终数据框
     println!("\n步骤18: 创建最终数据框");
+    let aggregated_x_sum = rsm_matrix.sum_axis(Axis(1));
+    
+    // OUTPUT STEP 11: Save aggregated matrix
+    let aggregated_2d = aggregated_x_sum.slice(s![0, .., ..]).to_owned();
+    save_array2_to_json(&aggregated_2d, &format!("{}/old_version_step11_aggregated_matrix.json", output_dir))?;
+    
     let final_df = create_final_dataframe(
         &rsm_matrix,
         &frag_info,
@@ -649,13 +949,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // 导出最终结果
     println!("\n步骤19: 导出最终结果");
-    let mut df_file = File::create("final_intensity_data.csv")?;
+    let output_path = format!("{}/old_version_step12_final_dataframe.csv", output_dir);
+    let mut df_file = File::create(output_path)?;
     CsvWriter::new(&mut df_file)
         .include_header(true)
         .finish(&mut final_df.clone())?;
     
     let program_total_time = program_start.elapsed();
     println!("\n程序执行完成！总运行时间: {:.2}秒", program_total_time.as_secs_f64());
+    
+    println!("\n📁 老版本输出文件已保存到: {}", output_dir);
+    println!("   - Step 0: old_version_step0_each_lib_data.json");
+    println!("   - Step 0A: old_version_step0a_precursors_list.json, old_version_step0a_ms1_data_list.json, old_version_step0a_ms2_data_list.json, old_version_step0a_precursor_info_list.json");
+    println!("   - Step 0B: old_version_step0b_ms1_tensor_step1.json, old_version_step0b_ms2_tensor_step1.json");
+    println!("   - Step 0C: old_version_step0c_ms2_tensor_step2.json");
+    println!("   - Step 0D: old_version_step0d_ms1_range_list.json, old_version_step0d_ms2_range_list.json");
+    println!("   - Step 0E: old_version_step0e_ms1_extract_width_range_list.json, old_version_step0e_ms2_extract_width_range_list.json");
+    println!("   - Step 0F: old_version_step0f_assay_rt_kept_dict.json, old_version_step0f_assay_im_kept_dict.json, old_version_step0f_precursor_info_choose.json");
+    println!("   - Step 0G: old_version_step0g_precursor_feat.json");
+    println!("   - Step 0H: old_version_step0h_frag_info.json");
+    println!("   - Step 0I: old_version_step0i_timstof_summary.json");
+    println!("   - Step 0J: old_version_step0j_mz_range_details.json");
+    println!("   - Step 1: old_version_step1_precursor_result.json");
+    println!("   - Step 2: old_version_step2_precursor_result_int.json");
+    println!("   - Step 3: old_version_step3_precursor_result_filtered.json");
+    println!("   - Step 4: old_version_step4_merged_frag_result.json");
+    println!("   - Step 5: old_version_step5_frag_result_filtered.json");
+    println!("   - Step 6: old_version_step6_ms1_mask_matrix.json, old_version_step6_ms2_mask_matrix.json");
+    println!("   - Step 7: old_version_step7_rt_list.json");
+    println!("   - Step 8: old_version_step8_ms1_intensity_matrix.json, old_version_step8_ms2_intensity_matrix.json");
+    println!("   - Step 9: old_version_step9_ms1_reshaped.json, old_version_step9_ms2_reshaped.json");
+    println!("   - Step 10: old_version_step10_combined_matrix.json");
+    println!("   - Step 11: old_version_step11_aggregated_matrix.json");
+    println!("   - Step 12: old_version_step12_final_dataframe.csv");
     
     Ok(())
 }
