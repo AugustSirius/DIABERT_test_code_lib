@@ -40,6 +40,11 @@ DIA_*.d/
 !**/small_*.csv              # Keep files marked as small
 !**/config*.csv              # Keep configuration files
 
+# Large library files (TSV files can be very large)
+*.tsv
+!**/small_*.tsv              # Keep only files marked as small
+!**/config*.tsv              # Keep configuration files
+
 # Binary data files
 *.pkl
 *.npy
