@@ -1,0 +1,7 @@
+我现在主要在搭建新的 /Users/augustsirius/Desktop/DIABERT_test_code_lib/20250711/timstof/src/main.rs；
+
+这里我们需要参照 /Users/augustsirius/Desktop/DIABERT_test_code_lib/20250711/timstof/src/python-ground-truth.py 一些新的流程来搭建；
+
+我们已经搭建完成了python-ground-truth.py 中第一部分，现在请帮我搭建第二部分，应该可以直接借鉴 老版本全流程.rs 成熟的流程代码，
+
+帮我搭建完成，并且在 main 函数中帮我区分出第二部分开始，

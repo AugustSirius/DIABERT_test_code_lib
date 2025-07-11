@@ -1,298 +1,408 @@
-// src/main.rs
 mod utils;
 
-use std::{collections::HashMap, env, error::Error, path::Path};
-use polars::prelude::*;
+use utils::{
+    TimsTOFData, find_scan_for_index,
+    read_parquet_with_polars, library_records_to_dataframe,
+    merge_library_and_report, get_unique_precursor_ids,
+    process_library_fast, create_rt_im_dicts,
+    build_lib_matrix, build_precursors_matrix_step1,
+    build_precursors_matrix_step2, build_range_matrix_step3,
+    build_precursors_matrix_step3 as build_precursors_matrix_step3_full,
+    LibCols, get_rt_list,
+};
+
 use rayon::prelude::*;
-use timsrust::{converters::ConvertableDomain, readers::FrameReader, MSLevel};
+use std::{
+    collections::HashMap,
+    error::Error,
+    path::Path,
+    time::Instant,
+};
+use indicatif::{ProgressBar, ProgressStyle, ParallelProgressIterator};
+use ndarray::{Array1, Array2, s};
 
-#[derive(Debug, Clone)]
-pub struct TimsTOFData {
-    pub rt_values_min: Vec<f64>,
-    pub mobility_values: Vec<f64>,
-    pub mz_values: Vec<f64>,
-    pub intensity_values: Vec<u32>,
-    pub frame_indices: Vec<usize>,
-    pub scan_indices: Vec<usize>,
-}
+use timsrust::{
+    converters::ConvertableDomain,
+    readers::{FrameReader, MetadataReader},
+    MSLevel,
+};
 
-impl TimsTOFData {
-    pub fn new() -> Self {
-        TimsTOFData {
-            rt_values_min: Vec::new(),
-            mobility_values: Vec::new(),
-            mz_values: Vec::new(),
-            intensity_values: Vec::new(),
-            frame_indices: Vec::new(),
-            scan_indices: Vec::new(),
-        }
-    }
-    
-    pub fn filter_by_mz_range(&self, min_mz: f64, max_mz: f64) -> Self {
-        let mut filtered = TimsTOFData::new();
-        
-        for (i, &mz) in self.mz_values.iter().enumerate() {
-            if mz >= min_mz && mz <= max_mz {
-                filtered.rt_values_min.push(self.rt_values_min[i]);
-                filtered.mobility_values.push(self.mobility_values[i]);
-                filtered.mz_values.push(mz);
-                filtered.intensity_values.push(self.intensity_values[i]);
-                filtered.frame_indices.push(self.frame_indices[i]);
-                filtered.scan_indices.push(self.scan_indices[i]);
-            }
-        }
-        
-        filtered
-    }
-    
-    pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
-        let mut merged = TimsTOFData::new();
-        
-        for data in data_list {
-            merged.rt_values_min.extend(data.rt_values_min);
-            merged.mobility_values.extend(data.mobility_values);
-            merged.mz_values.extend(data.mz_values);
-            merged.intensity_values.extend(data.intensity_values);
-            merged.frame_indices.extend(data.frame_indices);
-            merged.scan_indices.extend(data.scan_indices);
-        }
-        
-        merged
-    }
-    
-    fn to_dataframe(&self) -> PolarsResult<DataFrame> {
-        let all_integers = self.mz_values.iter().all(|&mz| mz.fract() == 0.0);
-        
-        if all_integers {
-            let mz_integers: Vec<i64> = self.mz_values.iter()
-                .map(|&mz| mz as i64)
-                .collect();
-            
-            let df = DataFrame::new(vec![
-                Series::new("rt_values_min", &self.rt_values_min),
-                Series::new("mobility_values", &self.mobility_values),
-                Series::new("mz_values", mz_integers),
-                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
-            ])?;
-            Ok(df)
-        } else {
-            let df = DataFrame::new(vec![
-                Series::new("rt_values_min", &self.rt_values_min),
-                Series::new("mobility_values", &self.mobility_values),
-                Series::new("mz_values", &self.mz_values),
-                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
-            ])?;
-            Ok(df)
-        }
-    }
-}
-
-/// What one peak looks like after we flatten a frame
-#[derive(Debug, Clone)]
-struct PeakRow {
-    rt_values: f64,            // minutes
-    mobility_values: f64,      // 1/K0
-    mz_values: f64,            // m/z
-    intensity_values: u32,
-    frame_indices: u32,
-    scan_indices: u32,
-    precursor_indices: i32,    // 0 → MS1, otherwise MS2 window id
-    quad_low_mz_values: f64,   // only set for MS2
-    quad_high_mz_values: f64,  // only set for MS2
-}
-
-/// Flatten the whole .d folder into Vec<PeakRow>
-fn explode_tdf(bruker_d: &Path) -> Result<Vec<PeakRow>, Box<dyn Error>> {
-    let reader = FrameReader::new(bruker_d)?;
-    let md     = timsrust::readers::MetadataReader::new(&bruker_d.join("analysis.tdf"))?;
-    let mz_conv = md.mz_converter;
-    let im_conv = md.im_converter;
-
-    let rows: Vec<PeakRow> = (0..reader.len())
-        .into_par_iter()
-        .filter_map(|idx| reader.get(idx).ok())
-        .flat_map(|frame| {
-            let rt_min = frame.rt_in_seconds / 60.0;
-            let mut local_rows = Vec::with_capacity(frame.tof_indices.len());
-
-            match frame.ms_level {
-                MSLevel::MS1 => {
-                    for (pidx, (&tof, &inten)) in frame.tof_indices.iter()
-                                                   .zip(frame.intensities.iter())
-                                                   .enumerate() {
-                        let scan   = utils::find_scan_for_index(pidx, &frame.scan_offsets) as u32;
-                        let mz     = mz_conv.convert(tof as f64);
-                        let im     = im_conv.convert(scan as f64);
-
-                        local_rows.push(PeakRow {
-                            rt_values        : rt_min,
-                            mobility_values  : im,
-                            mz_values        : mz,
-                            intensity_values : inten,
-                            frame_indices    : frame.index as u32,
-                            scan_indices     : scan,
-                            precursor_indices: 0,     // MS1 marker
-                            quad_low_mz_values : 0.0,
-                            quad_high_mz_values: 0.0,
-                        });
-                    }
-                }
-                MSLevel::MS2 => {
-                    let qs = &frame.quadrupole_settings;
-                    // pre-compute every isolation window we have in that frame
-                    let mut windows: Vec<(usize, usize, f64, f64)> = Vec::new(); // (start_scan,end_scan,low,high)
-                    for i in 0..qs.isolation_mz.len() {
-                        if i >= qs.isolation_width.len() { continue; }
-                        let low  = qs.isolation_mz[i] - qs.isolation_width[i] / 2.0;
-                        let high = qs.isolation_mz[i] + qs.isolation_width[i] / 2.0;
-                        windows.push((qs.scan_starts[i], qs.scan_ends[i], low, high));
-                    }
-
-                    for (pidx, (&tof, &inten)) in frame.tof_indices.iter()
-                                                   .zip(frame.intensities.iter())
-                                                   .enumerate() {
-                        let scan = utils::find_scan_for_index(pidx, &frame.scan_offsets);
-                        // which quadrupole segment produced that scan?
-                        if let Some((win_id, (low, high))) = windows.iter()
-                            .enumerate()
-                            .find_map(|(i,(s,e,l,h))|
-                                      if scan >= *s && scan <= *e { Some((i,l,h)) } else { None })
-                        {
-                            let mz = mz_conv.convert(tof as f64);
-                            let im = im_conv.convert(scan as f64);
-                            local_rows.push(PeakRow {
-                                rt_values        : rt_min,
-                                mobility_values  : im,
-                                mz_values        : mz,
-                                intensity_values : inten,
-                                frame_indices    : frame.index as u32,
-                                scan_indices     : scan as u32,
-                                precursor_indices: (win_id + 1) as i32, // keep 1-based id like alphatims
-                                quad_low_mz_values : *low,
-                                quad_high_mz_values: *high,
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-            local_rows
-        }).collect();
-
-    Ok(rows)
-}
-
-/// Convert Vec<PeakRow> → polars DataFrame with identical column names to the Python code
-fn rows_to_df(rows: Vec<PeakRow>) -> PolarsResult<DataFrame> {
-    let len = rows.len();
-    let mut col_rt      = Vec::with_capacity(len);
-    let mut col_im      = Vec::with_capacity(len);
-    let mut col_mz      = Vec::with_capacity(len);
-    let mut col_int     = Vec::with_capacity(len);
-    let mut col_frame   = Vec::with_capacity(len);
-    let mut col_scan    = Vec::with_capacity(len);
-    let mut col_precidx = Vec::with_capacity(len);
-    let mut col_low     = Vec::with_capacity(len);
-    let mut col_high    = Vec::with_capacity(len);
-
-    for r in rows {
-        col_rt.push(r.rt_values);
-        col_im.push(r.mobility_values);
-        col_mz.push(r.mz_values);
-        col_int.push(r.intensity_values as f64);
-        col_frame.push(r.frame_indices);
-        col_scan.push(r.scan_indices);
-        col_precidx.push(r.precursor_indices);
-        col_low.push(r.quad_low_mz_values);
-        col_high.push(r.quad_high_mz_values);
-    }
-
-    DataFrame::new(vec![
-        Series::new("rt_values",           col_rt),
-        Series::new("mobility_values",     col_im),
-        Series::new("mz_values",           col_mz),
-        Series::new("intensity_values",    col_int),
-        Series::new("frame_indices",       col_frame),
-        Series::new("scan_indices",        col_scan),
-        Series::new("precursor_indices",   col_precidx),
-        Series::new("quad_low_mz_values",  col_low),
-        Series::new("quad_high_mz_values", col_high),
-    ])
-}
-
-/// Same behaviour as the Python helper
+//-------------------------------------------------------------
+//  FastChunkFinder (same public API, faster internals)
+//-------------------------------------------------------------
 pub struct FastChunkFinder {
-    sorted_keys: Vec<(f64,f64)>,
-    chunks     : HashMap<(f64,f64), DataFrame>,
+    low_bounds: Vec<f64>,          // sorted ascending
+    high_bounds: Vec<f64>,         // same length
+    chunks:     Vec<TimsTOFData>,  // same order
 }
 
 impl FastChunkFinder {
-    pub fn new(chunks: HashMap<(f64,f64), DataFrame>) -> Self {
-        let mut keys: Vec<_> = chunks.keys().cloned().collect();
-        keys.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap());
-        FastChunkFinder { sorted_keys: keys, chunks }
+    pub fn new(mut pairs: Vec<((f64, f64), TimsTOFData)>) -> Result<Self, Box<dyn Error>> {
+        if pairs.is_empty() {
+            return Err("no MS2 windows collected".into());
+        }
+        // sort once by low_mz
+        pairs.sort_by(|a, b| a.0 .0.partial_cmp(&b.0 .0).unwrap());
+
+        let (mut low, mut high, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        low.reserve(pairs.len());
+        high.reserve(pairs.len());
+        data.reserve(pairs.len());
+
+        for ((l, h), d) in pairs {
+            low.push(l);
+            high.push(h);
+            data.push(d);
+        }
+        Ok(Self { low_bounds: low, high_bounds: high, chunks: data })
     }
 
-    pub fn find(&self, value: f64) -> Option<&DataFrame> {
-        use bisect::Bisect;
-        // We only have bisect in nightly; implement quick inline binary-search
-        match self.sorted_keys.binary_search_by(|&(low,_)|
-                    if value < low { std::cmp::Ordering::Greater } // we want last key <= value
-                    else           { std::cmp::Ordering::Less    }) {
-            Ok(_) | Err(0) => None,
-            Err(idx) => {
-                let key = self.sorted_keys[idx-1];
-                if value >= key.0 && value <= key.1 {
-                    self.chunks.get(&key)
-                } else { None }
+    #[inline]
+    pub fn find(&self, mz: f64) -> Option<&TimsTOFData> {
+        match self.low_bounds.binary_search_by(|probe| probe.partial_cmp(&mz).unwrap()) {
+            Ok(idx) => Some(&self.chunks[idx]),         // exact match on lower bound
+            Err(0)  => None,                            // smaller than every window
+            Err(pos) => {
+                let idx = pos - 1;
+                if mz <= self.high_bounds[idx] {
+                    Some(&self.chunks[idx])
+                } else {
+                    None
+                }
             }
         }
     }
+
+    pub fn range_count(&self) -> usize { self.low_bounds.len() }
 }
 
+//-------------------------------------------------------------
+//  helpers
+//-------------------------------------------------------------
+#[inline]
+fn quantize(x: f64) -> u64 { (x * 10_000.0).round() as u64 }   // 0.0001 Da grid
+
+struct FrameSplit {
+    ms1: TimsTOFData,
+    ms2: Vec<((u64, u64), TimsTOFData)>,   // quantised key → data
+}
+
+/// read a Bruker run, fully parallel, zero String allocations
+fn read_timstof_grouped(
+    d_folder: &Path,
+) -> Result<(TimsTOFData, Vec<((f64, f64), TimsTOFData)>), Box<dyn Error>> {
+
+    let tdf_path = d_folder.join("analysis.tdf");
+    let meta   = MetadataReader::new(&tdf_path)?;
+    let mz_cv  = meta.mz_converter;
+    let im_cv  = meta.im_converter;
+
+    // ---------- PARALLEL pass over frames -----------------------------------
+    let frames = FrameReader::new(d_folder)?;
+    eprintln!("Processing {} frames...", frames.len());
+    
+    let pb = ProgressBar::new(frames.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
+    let splits: Vec<FrameSplit> = (0..frames.len()).into_par_iter().progress_with(pb).map(|idx| {
+        let frame   = frames.get(idx).expect("frame read");
+        let rt_min  = frame.rt_in_seconds / 60.0;
+        let mut ms1 = TimsTOFData::new();
+        let mut ms2_pairs: Vec<((u64,u64), TimsTOFData)> = Vec::new();
+
+        match frame.ms_level {
+            MSLevel::MS1 => {
+                // one tight loop, no branching
+                for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                    let mz = mz_cv.convert(tof as f64);
+                    let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                    let im   = im_cv.convert(scan as f64);
+                    ms1.rt_values_min.push(rt_min);
+                    ms1.mobility_values.push(im);
+                    ms1.mz_values.push(mz);
+                    ms1.intensity_values.push(intensity);
+                    ms1.frame_indices.push(frame.index);
+                    ms1.scan_indices.push(scan);
+                }
+            }
+            MSLevel::MS2 => {
+                // handle every quadrupole window inside this frame
+                let qs = &frame.quadrupole_settings;
+                for win in 0..qs.isolation_mz.len() {
+                    if win >= qs.isolation_width.len() { break; }
+                    let prec_mz = qs.isolation_mz[win];
+                    let width   = qs.isolation_width[win];
+                    let low     = prec_mz - width * 0.5;
+                    let high    = prec_mz + width * 0.5;
+                    let key     = (quantize(low), quantize(high));
+
+                    let mut td = TimsTOFData::new();
+                    for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                        let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                        if scan < qs.scan_starts[win] || scan > qs.scan_ends[win] { continue; }
+                        let mz  = mz_cv.convert(tof as f64);
+                        let im  = im_cv.convert(scan as f64);
+                        td.rt_values_min.push(rt_min);
+                        td.mobility_values.push(im);
+                        td.mz_values.push(mz);
+                        td.intensity_values.push(intensity);
+                        td.frame_indices.push(frame.index);
+                        td.scan_indices.push(scan);
+                    }
+                    ms2_pairs.push((key, td));
+                }
+            }
+            _ => {}
+        }
+
+        FrameSplit { ms1, ms2: ms2_pairs }
+    }).collect();
+
+    // ---------- merge the thread-local structures ---------------------------
+    eprintln!("Merging results from {} frame splits...", splits.len());
+    
+    let merge_pb = ProgressBar::new(splits.len() as u64);
+    merge_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}] {pos}/{len} merging...")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
+    let mut global_ms1 = TimsTOFData::new();
+    let mut ms2_hash: HashMap<(u64,u64), TimsTOFData> = HashMap::new();
+
+    for split in splits {
+        // MS1
+        global_ms1.rt_values_min.extend(split.ms1.rt_values_min);
+        global_ms1.mobility_values.extend(split.ms1.mobility_values);
+        global_ms1.mz_values.extend(split.ms1.mz_values);
+        global_ms1.intensity_values.extend(split.ms1.intensity_values);
+        global_ms1.frame_indices.extend(split.ms1.frame_indices);
+        global_ms1.scan_indices.extend(split.ms1.scan_indices);
+
+        // MS2 windows
+        for (key, mut td) in split.ms2 {
+            ms2_hash.entry(key).or_insert_with(TimsTOFData::new)
+                    .merge_from(&mut td);
+        }
+        
+        merge_pb.inc(1);
+    }
+    
+    merge_pb.finish_with_message("Merging complete!");
+
+    // convert quantised keys back to (f64,f64) + collect into Vec
+    eprintln!("Converting {} MS2 windows...", ms2_hash.len());
+    let mut ms2_vec = Vec::with_capacity(ms2_hash.len());
+    for ((q_low, q_high), td) in ms2_hash {
+        let low  = q_low  as f64 / 10_000.0;
+        let high = q_high as f64 / 10_000.0;
+        ms2_vec.push(((low, high), td));
+    }
+
+    Ok((global_ms1, ms2_vec))
+}
+
+// helper to merge two TimsTOFData quickly
+trait MergeFrom { fn merge_from(&mut self, other: &mut Self); }
+impl MergeFrom for TimsTOFData {
+    fn merge_from(&mut self, other: &mut Self) {
+        self.rt_values_min.append(&mut other.rt_values_min);
+        self.mobility_values.append(&mut other.mobility_values);
+        self.mz_values.append(&mut other.mz_values);
+        self.intensity_values.append(&mut other.intensity_values);
+        self.frame_indices.append(&mut other.frame_indices);
+        self.scan_indices.append(&mut other.scan_indices);
+    }
+}
+
+//-------------------------------------------------------------
+//  main
+//-------------------------------------------------------------
 fn main() -> Result<(), Box<dyn Error>> {
-    let bruker_path = env::args().nth(1)
-        .expect("Usage: cargo run --release -- <bruker.d>");
-    let bruker_d = Path::new(&bruker_path);
-    println!("Reading {:?}", bruker_d);
-
-    // 1. explode whole data set
-    let rows   = explode_tdf(bruker_d)?;
-    let mut df = rows_to_df(rows)?;
-
-    // 2. sort by mz for faster binary search later
-    df.set_sorted(vec![("mz_values".into(), true)])?;
-
-    // 3. build MS1/MS2 slices like Python
-    let df_ms1 = df.filter(&df.column("precursor_indices")?.i32()?.equal(0))?;
-    let df_ms2 = df.filter(&df.column("precursor_indices")?.i32()?.not_equal(0))?;
-
-    // 4. emulate pandas groupby on (low , high)
-    let low   = df_ms2.column("quad_low_mz_values")?.f64()?;
-    let high  = df_ms2.column("quad_high_mz_values")?.f64()?;
-    let mut mapping: HashMap<(f64,f64), Vec<usize>> = HashMap::new();
-    for (idx,(l,h)) in low.into_no_null_iter().zip(high.into_no_null_iter()).enumerate() {
-        mapping.entry((l,h)).or_default().push(idx);
-    }
-    let mut chunks: HashMap<(f64,f64), DataFrame> = HashMap::new();
-    for (key, idxs) in mapping {
-        chunks.insert(key, df_ms2.take_iter( idxs.into_iter().map(|i| i as u32) )?);
+    // Use sample D folder for first part
+    let d_folder = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/DIA_sample.d";
+    let d_path = Path::new(&d_folder);
+    if !d_path.exists() {
+        return Err(format!("folder {:?} not found", d_path).into());
     }
 
-    // 5. construct fast finder
-    let finder = FastChunkFinder::new(chunks);
-    println!("Finder initialised – {} MS2 isolation windows detected", finder.sorted_keys.len());
+    println!("========== PART 1: TimsTOF Data Processing ==========");
+    eprintln!("Starting TimsTOF data processing...");
+    let t0 = std::time::Instant::now();
+    let (ms1, ms2_pairs) = read_timstof_grouped(d_path)?;
+    let decode_time = t0.elapsed();
+    
+    println!("✓ Total decode time: {:.2}s", decode_time.as_secs_f32());
+    println!("✓ MS1 peaks  : {}", ms1.mz_values.len());
+    println!("✓ MS2 windows: {}", ms2_pairs.len());
 
-    // 6. demo lookup
-    let demo_mz = 500.0;
-    if let Some(chunk) = finder.find(demo_mz) {
-        println!("Demo – found {} rows for m/z={demo_mz}", chunk.height());
-    } else {
-        println!("Demo – m/z={demo_mz} not inside any MS2 isolation window");
+    eprintln!("Building FastChunkFinder...");
+    let finder_start = std::time::Instant::now();
+    let finder = FastChunkFinder::new(ms2_pairs)?;
+    eprintln!("✓ FastChunkFinder built ({} ranges) in {:.2}s", 
+             finder.range_count(), finder_start.elapsed().as_secs_f32());
+
+    // Test queries
+    eprintln!("Running test queries...");
+    for q in [350.0, 550.0, 750.0, 950.0] {
+        match finder.find(q) {
+            None   => println!("m/z {:.1} → not in any window", q),
+            Some(d)=> println!("m/z {:.1} → window with {} peaks", q, d.mz_values.len()),
+        }
     }
 
-    // 7. optionally export the MS1/MS2 tables to feather/parquet/…
-    // df_ms1.write_parquet("ms1.parquet", ParquetWriteOptions::default())?;
+    println!("\n========== PART 2: Library and Report Processing ==========");
+    
+    // Read library file
+    let lib_file_path = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/helper/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
+    let library_records = process_library_fast(lib_file_path)?;
+    println!("✓ Loaded {} library records", library_records.len());
+    
+    // Convert to DataFrame
+    eprintln!("Converting library to DataFrame...");
+    let library_df = library_records_to_dataframe(library_records.clone())?;
+    println!("✓ Library DataFrame created with {} rows", library_df.height());
+    
+    // Read DIA-NN report
+    let report_file_path = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/helper/report/report.parquet";
+    eprintln!("Reading DIA-NN report...");
+    let report_df = read_parquet_with_polars(report_file_path)?;
+    println!("✓ Report loaded with {} rows", report_df.height());
+    
+    // Merge library and report
+    eprintln!("Merging library and report data...");
+    let diann_result = merge_library_and_report(library_df, report_df)?;
+    println!("✓ Merged data: {} rows", diann_result.height());
+    
+    // Get unique precursor IDs
+    eprintln!("Extracting unique precursor IDs...");
+    let diann_precursor_id_all = get_unique_precursor_ids(&diann_result)?;
+    println!("✓ Found {} unique precursors", diann_precursor_id_all.height());
+    
+    // Create RT and IM dictionaries
+    eprintln!("Creating RT and IM lookup dictionaries...");
+    let (assay_rt_kept_dict, assay_im_kept_dict) = create_rt_im_dicts(&diann_precursor_id_all)?;
+    println!("✓ RT dictionary: {} entries", assay_rt_kept_dict.len());
+    println!("✓ IM dictionary: {} entries", assay_im_kept_dict.len());
+    
+    // Get all precursor IDs with RT values
+    let precursor_id_all: Vec<String> = assay_rt_kept_dict.keys().cloned().collect();
+    println!("✓ Total precursors with RT: {}", precursor_id_all.len());
+    
+    // Device and parameters
+    let device = "cpu";
+    let frag_repeat_num = 5;
+    println!("\n✓ Configuration:");
+    println!("  - Device: {}", device);
+    println!("  - Fragment repeat num: {}", frag_repeat_num);
 
+    println!("\n========== PART 3: Single Precursor Extraction Timing ==========");
+    
+    // Start timing for single precursor extraction
+    let start_time = Instant::now();
+    
+    // Select a single precursor for testing
+    let precursor_id_list = vec!["VAFSAVR2"];
+    println!("Processing precursor: {:?}", precursor_id_list);
+    
+    // Filter library data for the selected precursor
+    let each_lib_data: Vec<_> = library_records.iter()
+        .filter(|record| precursor_id_list.contains(&record.transition_group_id.as_str()))
+        .cloned()
+        .collect();
+    
+    if each_lib_data.is_empty() {
+        println!("Warning: No matching precursor data found for {:?}", precursor_id_list);
+        return Ok(());
+    }
+    
+    println!("✓ Found {} library records for precursor", each_lib_data.len());
+    
+    // Build library matrix
+    let lib_cols = LibCols::default();
+    let (precursors_list, ms1_data_list, ms2_data_list, precursor_info_list) = 
+        build_lib_matrix(
+            &each_lib_data,
+            &lib_cols,
+            None,    // delta_rt_dict
+            None,    // delta_im_dict
+            5,       // frag_repeat_num
+            1801.0,  // max_mz
+            20,      // max_fragment
+            None,    // extra_cols
+        )?;
+    
+    println!("✓ Built library matrix:");
+    println!("  - Precursors: {}", precursors_list.len());
+    println!("  - MS1 data entries: {}", ms1_data_list.len());
+    println!("  - MS2 data entries: {}", ms2_data_list.len());
+    
+    // Build precursors matrix step 1
+    let (ms1_data_tensor, ms2_data_tensor) = 
+        build_precursors_matrix_step1(&ms1_data_list, &ms2_data_list, device)?;
+    println!("✓ Built tensor step 1:");
+    println!("  - MS1 tensor shape: {:?}", ms1_data_tensor.shape());
+    println!("  - MS2 tensor shape: {:?}", ms2_data_tensor.shape());
+    
+    // Build precursors matrix step 2
+    let ms2_data_tensor = build_precursors_matrix_step2(ms2_data_tensor);
+    println!("✓ Processed MS2 tensor in step 2");
+    
+    // Build range matrix step 3
+    let (ms1_range_list, ms2_range_list) = 
+        build_range_matrix_step3(&ms1_data_tensor, &ms2_data_tensor, frag_repeat_num, device)?;
+    println!("✓ Built range matrices:");
+    println!("  - MS1 range shape: {:?}", ms1_range_list.shape());
+    println!("  - MS2 range shape: {:?}", ms2_range_list.shape());
+    
+    // Build precursors matrix step 3 (full)
+    let (ms1_data_tensor, ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list) = 
+        build_precursors_matrix_step3_full(&ms1_data_tensor, &ms2_data_tensor, frag_repeat_num, device)?;
+    println!("✓ Built extract width range lists:");
+    println!("  - MS1 extract width shape: {:?}", ms1_extract_width_range_list.shape());
+    println!("  - MS2 extract width shape: {:?}", ms2_extract_width_range_list.shape());
+    
+    // Create precursor info array
+    let precursor_info_np_org: Vec<Vec<f64>> = precursor_info_list.iter()
+        .map(|info| info.clone())
+        .collect();
+    
+    // Extract precursor info (first 5 columns)
+    let precursor_info_choose: Vec<Vec<f64>> = precursor_info_np_org.iter()
+        .map(|row| row[..5.min(row.len())].to_vec())
+        .collect();
+    
+    // Create delta RT array (all zeros)
+    let delta_rt_kept: Vec<f64> = vec![0.0; precursors_list.len()];
+    
+    // Get RT values from dictionary
+    let assay_rt_kept: Vec<f64> = precursors_list.iter()
+        .map(|prec| assay_rt_kept_dict.get(&prec[0]).copied().unwrap_or(0.0))
+        .collect();
+    
+    // Get IM values from dictionary
+    let assay_im_kept: Vec<f64> = precursors_list.iter()
+        .map(|prec| assay_im_kept_dict.get(&prec[0]).copied().unwrap_or(0.0))
+        .collect();
+    
+    println!("✓ Prepared precursor metadata:");
+    println!("  - Delta RT values: {}", delta_rt_kept.len());
+    println!("  - Assay RT values: {}", assay_rt_kept.len());
+    println!("  - Assay IM values: {}", assay_im_kept.len());
+    
+    // Calculate elapsed time
+    let elapsed_time = start_time.elapsed();
+    println!("\n⏱️  Single precursor extraction time: {:.6} seconds", elapsed_time.as_secs_f64());
+    println!("   ({:.3} ms)", elapsed_time.as_millis());
+    
+    println!("\n🎉 Processing complete! Total time: {:.2}s", t0.elapsed().as_secs_f32());
+    
     Ok(())
 }

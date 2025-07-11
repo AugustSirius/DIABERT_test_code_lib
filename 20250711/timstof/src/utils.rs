@@ -6,9 +6,90 @@ use timsrust::converters::ConvertableDomain;
 use polars::prelude::*;
 use std::fs::File;
 use std::io::Write;
-use crate::TimsTOFData;
 use rayon::prelude::*;
-use csv::Writer;
+use csv::{Writer, ReaderBuilder};
+
+// TimsTOF数据结构
+#[derive(Debug, Clone)]
+pub struct TimsTOFData {
+    pub rt_values_min: Vec<f64>,
+    pub mobility_values: Vec<f64>,
+    pub mz_values: Vec<f64>,
+    pub intensity_values: Vec<u32>,
+    pub frame_indices: Vec<usize>,
+    pub scan_indices: Vec<usize>,
+}
+
+impl TimsTOFData {
+    pub fn new() -> Self {
+        TimsTOFData {
+            rt_values_min: Vec::new(),
+            mobility_values: Vec::new(),
+            mz_values: Vec::new(),
+            intensity_values: Vec::new(),
+            frame_indices: Vec::new(),
+            scan_indices: Vec::new(),
+        }
+    }
+    
+    pub fn filter_by_mz_range(&self, min_mz: f64, max_mz: f64) -> Self {
+        let mut filtered = TimsTOFData::new();
+        
+        for (i, &mz) in self.mz_values.iter().enumerate() {
+            if mz >= min_mz && mz <= max_mz {
+                filtered.rt_values_min.push(self.rt_values_min[i]);
+                filtered.mobility_values.push(self.mobility_values[i]);
+                filtered.mz_values.push(mz);
+                filtered.intensity_values.push(self.intensity_values[i]);
+                filtered.frame_indices.push(self.frame_indices[i]);
+                filtered.scan_indices.push(self.scan_indices[i]);
+            }
+        }
+        
+        filtered
+    }
+    
+    pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
+        let mut merged = TimsTOFData::new();
+        
+        for data in data_list {
+            merged.rt_values_min.extend(data.rt_values_min);
+            merged.mobility_values.extend(data.mobility_values);
+            merged.mz_values.extend(data.mz_values);
+            merged.intensity_values.extend(data.intensity_values);
+            merged.frame_indices.extend(data.frame_indices);
+            merged.scan_indices.extend(data.scan_indices);
+        }
+        
+        merged
+    }
+    
+    pub fn to_dataframe(&self) -> PolarsResult<DataFrame> {
+        let all_integers = self.mz_values.iter().all(|&mz| mz.fract() == 0.0);
+        
+        if all_integers {
+            let mz_integers: Vec<i64> = self.mz_values.iter()
+                .map(|&mz| mz as i64)
+                .collect();
+            
+            let df = DataFrame::new(vec![
+                Series::new("rt_values_min", &self.rt_values_min),
+                Series::new("mobility_values", &self.mobility_values),
+                Series::new("mz_values", mz_integers),
+                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
+            ])?;
+            Ok(df)
+        } else {
+            let df = DataFrame::new(vec![
+                Series::new("rt_values_min", &self.rt_values_min),
+                Series::new("mobility_values", &self.mobility_values),
+                Series::new("mz_values", &self.mz_values),
+                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
+            ])?;
+            Ok(df)
+        }
+    }
+}
 
 // 设备类型枚举
 #[derive(Debug, Clone, Copy)]
@@ -232,7 +313,7 @@ pub fn build_ext_ms2_matrix(ms2_data_tensor: &Array3<f32>, device: &str) -> Arra
 
 // 未使用的函数
 pub fn build_intensity_matrix(
-    data: &crate::TimsTOFData,
+    data: &TimsTOFData,
     extract_width_range_list: &Array2<f32>,
     frag_moz_matrix: &Array2<f32>,
     all_rt: &[f64],
@@ -283,7 +364,7 @@ pub fn process_ms1_frame(
     ms1_mz_max: f64,
     mz_converter: &timsrust::converters::Tof2MzConverter,
     im_converter: &timsrust::converters::Scan2ImConverter,
-    ms1_data: &mut crate::TimsTOFData,
+    ms1_data: &mut TimsTOFData,
 ) {
     for (peak_idx, (&tof, &intensity)) in frame.tof_indices.iter()
         .zip(frame.intensities.iter())
@@ -313,7 +394,7 @@ pub fn process_ms2_frame(
     ms1_mz_max: f64,
     mz_converter: &timsrust::converters::Tof2MzConverter,
     im_converter: &timsrust::converters::Scan2ImConverter,
-    ms2_windows: &mut HashMap<String, crate::TimsTOFData>,
+    ms2_windows: &mut HashMap<String, TimsTOFData>,
 ) {
     let quad_settings = &frame.quadrupole_settings;
     
@@ -331,7 +412,7 @@ pub fn process_ms2_frame(
         }
         
         let window_key = format!("{:.2}_{:.2}", precursor_mz, isolation_width);
-        let window_data = ms2_windows.entry(window_key).or_insert_with(crate::TimsTOFData::new);
+        let window_data = ms2_windows.entry(window_key).or_insert_with(TimsTOFData::new);
         
         for (peak_idx, (&tof, &intensity)) in frame.tof_indices.iter()
             .zip(frame.intensities.iter())
@@ -567,6 +648,187 @@ pub fn convert_mz_to_integer(data: &TimsTOFData) -> TimsTOFData {
         .collect();
     
     converted
+}
+
+// ----------------------------- New functions from main.rs -----------------------------
+
+pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<dyn Error>> {
+    eprintln!("Reading library file: {}", file_path);
+    let file = File::open(file_path)?;
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(true)
+        .from_reader(file);
+    
+    let headers = reader.headers()?.clone();
+    let mut column_indices = HashMap::new();
+    for (i, header) in headers.iter().enumerate() {
+        column_indices.insert(header, i);
+    }
+    
+    // Get library column mapping
+    let lib_col_dict = get_lib_col_dict();
+    let mut mapped_indices: HashMap<&str, usize> = HashMap::new();
+    for (old_col, new_col) in &lib_col_dict {
+        if let Some(&idx) = column_indices.get(old_col) {
+            mapped_indices.insert(new_col, idx);
+        }
+    }
+    
+    let fragment_number_idx = column_indices.get("FragmentNumber").copied();
+    
+    // Read all records into memory first
+    let mut byte_records = Vec::new();
+    for result in reader.byte_records() {
+        byte_records.push(result?);
+    }
+    
+    eprintln!("Processing {} library records...", byte_records.len());
+    
+    // Process records in parallel
+    let records: Vec<LibraryRecord> = byte_records.par_iter().map(|record| {
+        let mut rec = LibraryRecord {
+            transition_group_id: String::new(),
+            peptide_sequence: String::new(),
+            full_unimod_peptide_name: String::new(),
+            precursor_charge: String::new(),
+            precursor_mz: String::new(),
+            tr_recalibrated: String::new(),
+            product_mz: String::new(),
+            fragment_type: String::new(),
+            fragment_charge: String::new(),
+            fragment_number: String::new(),
+            library_intensity: String::new(),
+            protein_id: String::new(),
+            protein_name: String::new(),
+            gene: String::new(),
+            decoy: "0".to_string(),
+            other_columns: HashMap::new(),
+        };
+        
+        // Fill fields from mapped columns
+        if let Some(&idx) = mapped_indices.get("PeptideSequence") { 
+            if let Some(val) = record.get(idx) { 
+                rec.peptide_sequence = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("FullUniModPeptideName") { 
+            if let Some(val) = record.get(idx) { 
+                rec.full_unimod_peptide_name = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("PrecursorCharge") { 
+            if let Some(val) = record.get(idx) { 
+                rec.precursor_charge = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("PrecursorMz") { 
+            if let Some(val) = record.get(idx) { 
+                rec.precursor_mz = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProductMz") { 
+            if let Some(val) = record.get(idx) { 
+                rec.product_mz = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("FragmentType") {
+            if let Some(val) = record.get(idx) {
+                let fragment_str = String::from_utf8_lossy(val);
+                rec.fragment_type = match fragment_str.as_ref() { 
+                    "b" => "1".to_string(), 
+                    "y" => "2".to_string(), 
+                    "p" => "3".to_string(), 
+                    _ => fragment_str.into_owned() 
+                };
+            }
+        }
+        if let Some(&idx) = mapped_indices.get("FragmentCharge") { 
+            if let Some(val) = record.get(idx) { 
+                rec.fragment_charge = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("LibraryIntensity") { 
+            if let Some(val) = record.get(idx) { 
+                rec.library_intensity = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("Tr_recalibrated") { 
+            if let Some(val) = record.get(idx) { 
+                rec.tr_recalibrated = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProteinID") { 
+            if let Some(val) = record.get(idx) { 
+                rec.protein_id = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("Gene") { 
+            if let Some(val) = record.get(idx) { 
+                rec.gene = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProteinName") { 
+            if let Some(val) = record.get(idx) { 
+                rec.protein_name = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        
+        if let Some(idx) = fragment_number_idx {
+            if let Some(val) = record.get(idx) {
+                rec.fragment_number = String::from_utf8_lossy(val).into_owned();
+            }
+        }
+        
+        // Generate transition_group_id
+        rec.transition_group_id = format!("{}{}", rec.full_unimod_peptide_name, rec.precursor_charge);
+        rec
+    }).collect();
+    
+    Ok(records)
+}
+
+pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>, HashMap<String, f64>)> {
+    let id_col = df.column("transition_group_id")?;
+    let id_vec = id_col.str()?.into_iter()
+        .map(|opt| opt.unwrap_or("").to_string())
+        .collect::<Vec<String>>();
+    
+    let rt_col = df.column("RT")?;
+    let rt_vec: Vec<f64> = match rt_col.dtype() {
+        DataType::Float32 => rt_col.f32()?.into_iter()
+            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .collect(),
+        DataType::Float64 => rt_col.f64()?.into_iter()
+            .map(|opt| opt.unwrap_or(f64::NAN))
+            .collect(),
+        _ => return Err(PolarsError::SchemaMismatch(
+            format!("RT column type is not float: {:?}", rt_col.dtype()).into()
+        )),
+    };
+    
+    let im_col = df.column("IM")?;
+    let im_vec: Vec<f64> = match im_col.dtype() {
+        DataType::Float32 => im_col.f32()?.into_iter()
+            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .collect(),
+        DataType::Float64 => im_col.f64()?.into_iter()
+            .map(|opt| opt.unwrap_or(f64::NAN))
+            .collect(),
+        _ => return Err(PolarsError::SchemaMismatch(
+            format!("IM column type is not float: {:?}", im_col.dtype()).into()
+        )),
+    };
+    
+    let mut rt_dict = HashMap::new();
+    let mut im_dict = HashMap::new();
+    
+    for ((id, rt), im) in id_vec.iter().zip(rt_vec.iter()).zip(im_vec.iter()) {
+        rt_dict.insert(id.clone(), *rt);
+        im_dict.insert(id.clone(), *im);
+    }
+    
+    Ok((rt_dict, im_dict))
 }
 
 // ----------------------------- End of moved functions -----------------------------
