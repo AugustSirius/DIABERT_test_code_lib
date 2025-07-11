@@ -1,0 +1,9 @@
+[package]
+name    = "bruker_reader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+timsrust  = "0.4.2"
+rayon     = "1.8"
+indicatif = "0.17"

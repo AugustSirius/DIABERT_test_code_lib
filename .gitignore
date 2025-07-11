@@ -1,0 +1,231 @@
+# ============================================================================
+# DIABERT Project .gitignore
+# Mass Spectrometry Data Analysis Project
+# ============================================================================
+
+# ============================================================================
+# MASS SPECTROMETRY DATA FILES (Large binary files)
+# ============================================================================
+# Bruker TimsTOF data folders
+*.d/
+*.d
+CAD*.d/
+DDA_*.d/
+DIA_*.d/
+*_TPHP_*.d/
+*_pool*.d/
+*.tdf
+*.tdf_bin
+*.tdf_raw
+*.sqlite
+*.sqlite-journal
+
+# Large data files
+*.parquet
+*.hdf5
+*.h5
+*.mzML
+*.mzXML
+*.raw
+*.wiff
+*.wiff2
+
+# ============================================================================
+# DATA OUTPUT FILES (Generated results)
+# ============================================================================
+# CSV files (many are large result files)
+*.csv
+!lib/*.csv                    # Keep small library files
+!helper/lib/*.csv            # Keep small library files
+!**/small_*.csv              # Keep files marked as small
+!**/config*.csv              # Keep configuration files
+
+# Binary data files
+*.pkl
+*.npy
+*.pt
+*.bin
+*.dat
+
+# ============================================================================
+# TEMPORARY AND CACHE DIRECTORIES
+# ============================================================================
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ============================================================================
+# RUST BUILD ARTIFACTS
+# ============================================================================
+# Rust target directories
+target/
+**target/
+Cargo.lock
+!timsrust*/Cargo.lock        # Keep timsrust library lock files
+
+# ============================================================================
+# ARCHIVED AND VERSIONED FOLDERS
+# ============================================================================
+# Archive folders
+archive/
+Archive/
+ARCHIVE/
+legacy/
+Legacy/
+LEGACY/
+backup/
+Backup/
+BACKUP/
+
+# Dated experimental folders (keep only the most recent)
+20250628/
+20250630/
+20250702/
+20250703/
+20250707/
+20250708/
+20250709/
+20250710/
+# Keep 20250711/ as the most recent
+
+# Versioned folders
+*_v[0-9]*/
+*_v[0-9].[0-9]*/
+*_copy/
+*_backup/
+*稳定版*/
+*废弃*/
+*_废弃*/
+
+# ============================================================================
+# OUTPUT AND RESULT DIRECTORIES
+# ============================================================================
+# Output directories
+output/
+Output/
+results/
+Results/
+python输出结果/
+rust结果文件夹/
+python结果文件夹/
+调试输出文件/
+temp/
+tmp/
+临时文件/
+
+# Plot and image outputs
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+!README*.png                 # Keep README images
+!docs/**/*.png               # Keep documentation images
+
+# ============================================================================
+# ENVIRONMENT AND CONFIGURATION
+# ============================================================================
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+conda-meta/
+.conda/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+# LANGUAGE-SPECIFIC
+# ============================================================================
+# Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Rust
+**/*.rs.bk
+*.pdb
+
+# ============================================================================
+# LARGE TEST DATA AND SAMPLES
+# ============================================================================
+# Test data directories
+test_data/
+sample_data/
+大数据/
+检查变量/
+**/检查变量/
+
+# Compressed archives
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
+*.rar
+!DIABERT_test_code_lib.zip   # Keep if it's a distribution archive
+
+# ============================================================================
+# LOGS AND TEMPORARY FILES
+# ============================================================================
+*.log
+*.tmp
+*.temp
+*.lock
+!Cargo.lock                  # Keep Cargo lock files for reproducibility
+
+# ============================================================================
+# MACHINE-SPECIFIC PATHS
+# ============================================================================
+# Avoid absolute paths in ignore patterns, but document them here
+# /Users/augustsirius/Desktop/DIABERT_test_code_lib/
+# D:\00.Westlake\00.Phd_candidate\01.LiuZW\
+
+# ============================================================================
+# KEEP THESE IMPORTANT FILES
+# ============================================================================
+# Force include important files (use ! to override ignores)
+!README.md
+!README.txt
+!LICENSE
+!Cargo.toml
+!pyproject.toml
+!requirements.txt
+!setup.py
+!*.rs
+!*.py
+!*.ipynb
+!*.md
+!*.toml
+!helper/lib/*.tsv            # Keep library files
+!lib/*.tsv                   # Keep library files 

@@ -1,0 +1,148 @@
+{
+  "timestamp": "2025-07-10T22:06:00.827175",
+  "precursor_id": "PGGPGETGK2",
+  "all_match": false,
+  "comparisons": [
+    {
+      "name": "precursor_feat",
+      "shape_match": true,
+      "arr1_shape": "(1, 8)",
+      "arr2_shape": "(1, 8)",
+      "max_diff": 0.0,
+      "mean_diff": 0.0,
+      "match": true,
+      "num_different": 0,
+      "total_elements": 8,
+      "diff_percentage": 0.0,
+      "correlation": 1.0
+    },
+    {
+      "name": "frag_info",
+      "shape_match": true,
+      "arr1_shape": "(1, 72, 4)",
+      "arr2_shape": "(1, 72, 4)",
+      "max_diff": 0.0,
+      "mean_diff": 0.0,
+      "match": true,
+      "num_different": 0,
+      "total_elements": 288,
+      "diff_percentage": 0.0,
+      "correlation": 0.9999999999999998
+    },
+    {
+      "name": "ms1_frag_moz_matrix",
+      "shape_match": true,
+      "tensor1_shape": "torch.Size([30, 50])",
+      "tensor2_shape": "torch.Size([30, 50])",
+      "max_diff": 0.0,
+      "mean_diff": 0.0,
+      "match": true,
+      "num_different": 0,
+      "total_elements": 1500,
+      "diff_percentage": 0.0,
+      "correlation": 0.9999999403953552
+    },
+    {
+      "name": "ms2_frag_moz_matrix",
+      "shape_match": true,
+      "tensor1_shape": "torch.Size([330, 50])",
+      "tensor2_shape": "torch.Size([330, 50])",
+      "max_diff": 1.0,
+      "mean_diff": 0.01078787911683321,
+      "match": false,
+      "num_different": 178,
+      "total_elements": 16500,
+      "diff_percentage": 1.0787878787878786,
+      "correlation": 0.7944762706756592
+    },
+    {
+      "name": "ms1_frag_rt_matrix",
+      "shape_match": true,
+      "tensor1_shape": "torch.Size([30, 48])",
+      "tensor2_shape": "torch.Size([30, 48])",
+      "max_diff": 112.0,
+      "mean_diff": 0.2430555522441864,
+      "match": false,
+      "num_different": 4,
+      "total_elements": 1440,
+      "diff_percentage": 0.2777777777777778,
+      "correlation": -0.001085931435227394
+    },
+    {
+      "name": "ms2_frag_rt_matrix",
+      "shape_match": true,
+      "tensor1_shape": "torch.Size([330, 48])",
+      "tensor2_shape": "torch.Size([330, 48])",
+      "max_diff": 356.0,
+      "mean_diff": 0.5410353541374207,
+      "match": false,
+      "num_different": 96,
+      "total_elements": 15840,
+      "diff_percentage": 0.6060606060606061,
+      "correlation": 0.027736179530620575
+    },
+    {
+      "name": "final_data",
+      "shape_match": true,
+      "df1_shape": [
+        72,
+        52
+      ],
+      "df2_shape": [
+        72,
+        52
+      ],
+      "columns_match": false,
+      "index_match": true
+    },
+    {
+      "name": "precursor_result (after IM filter)",
+      "shape_match": false,
+      "df1_shape": [
+        8188,
+        4
+      ],
+      "df2_shape": [
+        10815,
+        4
+      ],
+      "columns_match": true,
+      "index_match": false
+    },
+    {
+      "name": "frag_result (after IM filter)",
+      "shape_match": false,
+      "df1_shape": [
+        1300,
+        4
+      ],
+      "df2_shape": [
+        13762,
+        4
+      ],
+      "columns_match": true,
+      "index_match": false
+    },
+    {
+      "name": "all_rt",
+      "shape_match": true,
+      "arr1_shape": "(48,)",
+      "arr2_shape": "(48,)",
+      "max_diff": 0.12369423333333174,
+      "mean_diff": 0.05176247118055555,
+      "match": false,
+      "num_different": 46,
+      "total_elements": 48,
+      "diff_percentage": 95.83333333333334,
+      "correlation": 0.9960904621646554
+    }
+  ],
+  "issues": [
+    "ms2_frag_moz_matrix: 数值差异 (最大差异: 1.0)",
+    "ms1_frag_rt_matrix: 数值差异 (最大差异: 112.0)",
+    "ms2_frag_rt_matrix: 数值差异 (最大差异: 356.0)",
+    "precursor_result (after IM filter): 形状不匹配",
+    "frag_result (after IM filter): 形状不匹配",
+    "all_rt: 数值差异 (最大差异: 0.12369423333333174)"
+  ]
+}

@@ -1,0 +1,19 @@
+Python vs Rust 数据处理结果比较报告
+==================================================
+
+Python记录数: 16722511
+Rust记录数: 16722511
+记录数是否一致: 是
+
+列差异:
+  ProteinID: 0 个不同 (0.00%)
+  ProductMz: 0 个不同 (0.00%)
+  LibraryIntensity: 0 个不同 (0.00%)
+  FragmentType: 0 个不同 (0.00%)
+  PrecursorCharge: 0 个不同 (0.00%)
+  Gene: 0 个不同 (0.00%)
+  PrecursorMz: 0 个不同 (0.00%)
+  PeptideSequence: 0 个不同 (0.00%)
+  decoy: 0 个不同 (0.00%)
+  FullUniModPeptideName: 0 个不同 (0.00%)
+  transition_group_id: 0 个不同 (0.00%)
