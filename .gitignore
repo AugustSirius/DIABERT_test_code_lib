@@ -251,8 +251,8 @@ sample_data/
 *.json
 !package.json               # Keep npm package files
 !tsconfig.json              # Keep TypeScript config
-!.vscode/*.json             # Keep VS Code settings
 !config*.json               # Keep configuration files
+!.vscode/*.json             # Keep VS Code settings
 
 # ============================================================================
 # MACHINE-SPECIFIC PATHS
@@ -278,4 +278,9 @@ sample_data/
 !*.md
 !*.toml
 !helper/lib/*.tsv            # Keep library files
-!lib/*.tsv                   # Keep library files 
+!lib/*.tsv                   # Keep library files
+
+# Force include important JSON files
+!package.json
+!tsconfig.json
+!config*.json 
