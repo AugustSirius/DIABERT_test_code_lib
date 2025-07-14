@@ -8,6 +8,7 @@
 # ============================================================================
 # Bruker TimsTOF data folders
 *.d/
+*.gz
 *.d
 CAD*.d/
 DDA_*.d/
@@ -72,6 +73,34 @@ coverage.xml
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
+
+# ============================================================================
+# TIMSTOF DATA CACHE (Custom caching system)
+# ============================================================================
+# TimsTOF cache directories
+.timstof_cache/
+**/.timstof_cache/
+timstof_cache/
+**/timstof_cache/
+
+# TimsTOF cache files
+*.raw.cache.gz
+*.raw.cache
+*.cache.gz
+*.timstof.cache
+*.timstof.cache.gz
+*.d.raw.cache.gz
+*.d.raw.cache
+*.d.meta
+*.cache.meta
+*.timstof.meta
+
+# Other potential cache patterns
+*_cache/
+*_cache.gz
+cache_*/
+Cache_*/
+.cache_*/
 
 # ============================================================================
 # RUST BUILD ARTIFACTS
