@@ -239,6 +239,22 @@ sample_data/
 !Cargo.lock                  # Keep Cargo lock files for reproducibility
 
 # ============================================================================
+# SCRIPT AND INTERMEDIATE FILES
+# ============================================================================
+# Shell scripts (mostly test and setup scripts)
+*.sh
+!install.sh                  # Keep important installation scripts
+!setup.sh                   # Keep important setup scripts if needed
+!build.sh                   # Keep important build scripts if needed
+
+# JSON files (mostly intermediate test results)
+*.json
+!package.json               # Keep npm package files
+!tsconfig.json              # Keep TypeScript config
+!.vscode/*.json             # Keep VS Code settings
+!config*.json               # Keep configuration files
+
+# ============================================================================
 # MACHINE-SPECIFIC PATHS
 # ============================================================================
 # Avoid absolute paths in ignore patterns, but document them here
