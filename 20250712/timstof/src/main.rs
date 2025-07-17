@@ -3,6 +3,7 @@
 //  src/main.rs   --  with Parallel Indexed Slicing and Parts 5+6 (timing only)
 //-------------------------------------------------------------
 mod utils;
+mod output;
 
 use utils::{
     TimsTOFData, find_scan_for_index,
@@ -629,6 +630,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // Process MS2 fragments with fast slicing
     let mut frag_results = Vec::new();
+    let mut valid_ms2_ranges = Vec::new();
     
     for j in 0..66 {
         let ms2_range_min_val = ms2_range_list[[i, j, 0]];
@@ -641,6 +643,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             frag_results.push(TimsTOFData::new());
             continue;
         }
+        
+        valid_ms2_ranges.push((ms2_range_min, ms2_range_max));
         
         if let Some(ms2_indexed) = df2_index_final {
             // Use indexed slicing instead of linear filtering
@@ -658,6 +662,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut frag_result_indexed = IndexedTimsTOFData::from_timstof_data(merged_frag_result);
     frag_result_indexed.convert_mz_to_integer();
     let frag_result_filtered = frag_result_indexed.filter_by_im_range(im_min, im_max);
+    
+    // ===== 添加输出功能 =====
+    // 需要在文件顶部添加: mod output;
+    use output::{OutputManager, SliceResult, create_ms1_data, create_ms2_data};
+    
+    let output_manager = OutputManager::new();
+    let slice_result = SliceResult {
+        version: "original".to_string(),
+        timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        precursor_id: precursors_list[i][0].clone(),
+        ms1_data: create_ms1_data(
+            &precursor_result_filtered,
+            (ms1_range_min, ms1_range_max),
+            (im_min, im_max),
+        ),
+        ms2_data: create_ms2_data(&frag_result_filtered, valid_ms2_ranges.len()),
+    };
+    
+    output_manager.save_slice_result(&slice_result)?;
+    // ===== 输出功能结束 =====
     
     // PART 5: Building Mask and Intensity Matrices
     

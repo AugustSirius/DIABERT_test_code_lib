@@ -7,7 +7,6 @@ import torch
 import os
 import timstof_PASEF_20250506
 import matplotlib.pyplot as plt
-import time  # 添加时间模块
 
 def get_lib_col_dict():
     lib_col_dict = defaultdict(str)
@@ -296,8 +295,6 @@ def build_frag_info(ms1_data_tensor, ms2_data_tensor, frag_repeat_num, device):
                                                                                   ms2_ext_shape[2]).cpu()
     frag_info = torch.cat([ext_ms1_precursors_frag_rt_matrix, ext_ms2_precursors_frag_rt_matrix], dim=2)
     frag_info = frag_info[:, 0, :, :]
-
-    print(f"frag_info shape: {frag_info.shape}")
     return frag_info
 
 # ============== EXECUTE FIRST CODE PROCESSING ==============
@@ -345,158 +342,38 @@ precursor_result['mz_values'] = np.ceil(precursor_result['mz_values'] * 1000)
 print(ms1_range)
 
 # 第一个导出点：过滤IM之前的数据
-precursor_result.to_csv('python_precursor_result_before_IM_filter.csv', index=False)
+precursor_result.to_csv('precursor_result_before_IM_filter.csv', index=False)
 print(f"Exported precursor_result before IM filter: {len(precursor_result)} rows")
 
 # Filter by IM
 precursor_result = precursor_result[(precursor_result['mobility_values'] <= IM + 0.05) & (precursor_result['mobility_values'] >= IM - 0.05)]
-print(f"After IM filter: {len(precursor_result)} rows")
+print(precursor_result)
 
 # 第二个导出点：过滤IM之后的数据
-precursor_result.to_csv('python_precursor_result_after_IM_filter.csv', index=False)
+precursor_result.to_csv('precursor_result_after_IM_filter.csv', index=False)
 print(f"Exported precursor_result after IM filter: {len(precursor_result)} rows")
 
-# ============== 修改的MS2提取部分 ==============
-print("\n========== 开始提取MS2碎片数据 ==========")
-start_time = time.time()
+# ---
+# 从这里开始修改
 
-# 打印MS2范围信息
-print(f"MS2范围矩阵形状: {ms2_range_list[i].shape}")
-print(f"将提取 66 个MS2碎片")
-
-# 初始化结果列表和计时
+# Extract MS2 fragments
 frag_result = []
-fragment_times = []
-
-# 提取每个碎片
 for j in range(0, 66):
-    fragment_start = time.time()
-    
-    # 获取该碎片的m/z范围
-    ms2_range_min = (ms2_range_list[i][j].min().item()-1)/1000
-    ms2_range_max = (ms2_range_list[i][j].max().item()+1)/1000
-    ms2_range = slice(ms2_range_min, ms2_range_max)
-    
-    # 提取数据
-    fragment_data = timstof_data[:, :, ms1_range, ms2_range][['rt_values_min', 'mobility_values', 'mz_values', 'intensity_values']]
-    frag_result.append(fragment_data)
-    
-    fragment_time = time.time() - fragment_start
-    fragment_times.append(fragment_time)
-    
-    # 进度报告
-    if j % 10 == 0:
-        print(f"  已处理 {j+1}/66 个碎片，最近10个碎片平均耗时: {np.mean(fragment_times[-10:]):.2f}秒")
-    
-    # 打印前几个碎片的详细信息
-    if j < 5:
-        print(f"    碎片 {j}: m/z范围 {ms2_range_min:.4f} - {ms2_range_max:.4f}, 数据点数: {len(fragment_data)}")
-
-# 合并所有碎片数据
-concat_start = time.time()
+    ms2_range = slice((ms2_range_list[i][j].min().item()-1)/1000, (ms2_range_list[i][j].max().item()+1)/1000)
+    frag_result.append(timstof_data[:, :, ms1_range, ms2_range][['rt_values_min', 'mobility_values',  'mz_values', 'intensity_values']])
 frag_result = pd.concat(frag_result, ignore_index=True)
-concat_time = time.time() - concat_start
-print(f"\n合并数据耗时: {concat_time:.2f}秒")
-
-# 转换m/z值为整数
 frag_result['mz_values'] = np.ceil(frag_result['mz_values'] * 1000)
 
-# 导出IM过滤前的MS2数据
-frag_result.to_csv('python_frag_result_before_IM_filter.csv', index=False)
-print(f"导出IM过滤前的MS2数据: {len(frag_result)} 行")
-
-# 统计信息
-print(f"\nIM过滤前的MS2数据统计:")
-print(f"  总数据点数: {len(frag_result)}")
-print(f"  m/z范围: {frag_result['mz_values'].min():.0f} - {frag_result['mz_values'].max():.0f}")
-print(f"  RT范围: {frag_result['rt_values_min'].min():.2f} - {frag_result['rt_values_min'].max():.2f}")
-print(f"  IM范围: {frag_result['mobility_values'].min():.4f} - {frag_result['mobility_values'].max():.4f}")
-
 # Filter by IM
-im_filter_start = time.time()
-frag_result_filtered = frag_result[(frag_result['mobility_values'] <= IM + 0.05) & (frag_result['mobility_values'] >= IM - 0.05)]
-im_filter_time = time.time() - im_filter_start
+frag_result = frag_result[(frag_result['mobility_values'] <= IM + 0.05) & (frag_result['mobility_values'] >= IM - 0.05)]
 
-# 导出IM过滤后的MS2数据
-frag_result_filtered.to_csv('python_frag_result_after_IM_filter.csv', index=False)
-print(f"\nIM过滤耗时: {im_filter_time:.2f}秒")
-print(f"IM过滤后的MS2数据: {len(frag_result_filtered)} 行 (保留比例: {len(frag_result_filtered)/len(frag_result)*100:.2f}%)")
-
-# 更新frag_result为过滤后的结果
-frag_result = frag_result_filtered
-
-# 总耗时
-total_time = time.time() - start_time
-print(f"\n========== MS2提取完成 ==========")
-print(f"总耗时: {total_time:.2f}秒")
-print(f"平均每个碎片耗时: {np.mean(fragment_times):.2f}秒")
-
-# ============== Build masks ==============
-print("\n========== 构建Mask矩阵 ==========")
-mask_start = time.time()
-
-# 创建搜索张量
+# Build masks
 search_ms1_tensor = torch.tensor(list(precursor_result['mz_values']))
 search_ms2_tensor = torch.tensor(list(frag_result['mz_values']))
-
-print(f"MS1搜索集合大小: {len(search_ms1_tensor)}")
-print(f"MS2搜索集合大小: {len(search_ms2_tensor)}")
-
-# 构建mask
-print("\n构建MS1 mask...")
-mask_ms1_start = time.time()
 mask_ms1 = torch.isin(ms1_extract_width_range_list[i], search_ms1_tensor)
-ms1_frag_moz_matrix = torch.where(mask_ms1, 1., 0.)
-mask_ms1_time = time.time() - mask_ms1_start
-print(f"MS1 mask构建耗时: {mask_ms1_time:.2f}秒")
-
-print("\n构建MS2 mask...")
-mask_ms2_start = time.time()
 mask_ms2 = torch.isin(ms2_extract_width_range_list[i], search_ms2_tensor)
+ms1_frag_moz_matrix = torch.where(mask_ms1, 1., 0.)
 ms2_frag_moz_matrix = torch.where(mask_ms2, 1., 0.)
-mask_ms2_time = time.time() - mask_ms2_start
-print(f"MS2 mask构建耗时: {mask_ms2_time:.2f}秒")
-
-mask_total_time = time.time() - mask_start
-print(f"\nMask构建总耗时: {mask_total_time:.2f}秒")
-
-# 统计非零元素
-ms1_nonzero = (ms1_frag_moz_matrix > 0).sum().item()
-ms2_nonzero = (ms2_frag_moz_matrix > 0).sum().item()
-
-print(f"\nMS1碎片矩阵形状: {ms1_frag_moz_matrix.shape}")
-print(f"MS1碎片矩阵非零元素: {ms1_nonzero} / {ms1_frag_moz_matrix.numel()} ({ms1_nonzero/ms1_frag_moz_matrix.numel()*100:.2f}%)")
-
-print(f"\nMS2碎片矩阵形状: {ms2_frag_moz_matrix.shape}")
-print(f"MS2碎片矩阵非零元素: {ms2_nonzero} / {ms2_frag_moz_matrix.numel()} ({ms2_nonzero/ms2_frag_moz_matrix.numel()*100:.2f}%)")
-
-# 保存mask矩阵
-np.savetxt('python_ms1_frag_moz_matrix.csv', ms1_frag_moz_matrix.numpy(), delimiter=',', fmt='%.0f')
-np.savetxt('python_ms2_frag_moz_matrix.csv', ms2_frag_moz_matrix.numpy(), delimiter=',', fmt='%.0f')
-print("\n已保存mask矩阵到CSV文件")
-
-# 保存矩阵摘要信息
-with open('python_mask_matrices_summary.txt', 'w') as f:
-    f.write("=== Python Mask Matrices Summary ===\n\n")
-    f.write(f"MS1 Fragment Matrix:\n")
-    f.write(f"  Shape: {ms1_frag_moz_matrix.shape}\n")
-    f.write(f"  Non-zero elements: {ms1_nonzero} / {ms1_frag_moz_matrix.numel()}\n")
-    f.write(f"  Density: {ms1_nonzero/ms1_frag_moz_matrix.numel()*100:.2f}%\n\n")
-    
-    f.write(f"MS2 Fragment Matrix:\n")
-    f.write(f"  Shape: {ms2_frag_moz_matrix.shape}\n")
-    f.write(f"  Non-zero elements: {ms2_nonzero} / {ms2_frag_moz_matrix.numel()}\n")
-    f.write(f"  Density: {ms2_nonzero/ms2_frag_moz_matrix.numel()*100:.2f}%\n\n")
-    
-    f.write(f"Timing Information:\n")
-    f.write(f"  MS2 extraction total time: {total_time:.2f}s\n")
-    f.write(f"  Average time per fragment: {np.mean(fragment_times):.2f}s\n")
-    f.write(f"  Mask building total time: {mask_total_time:.2f}s\n")
-
-print("\n========== 程序完成 ==========")
-print(f"总体执行时间: {time.time() - start_time:.2f}秒")
-
-# =========================================================
 
 # Get RT list
 all_rt = get_rt_list(list(set(list(precursor_result['rt_values_min'].unique())+list(frag_result['rt_values_min'].unique()))), RT)
@@ -584,45 +461,45 @@ print("Visualization completed!")
 
 # ============== EXPORT TO CSV FOR COMPARISON ==============
 
-# # Export the final dataframe to CSV (same as Rust output)
-# output_csv_path = 'precursor_result_python.csv'
+# Export the final dataframe to CSV (same as Rust output)
+output_csv_path = 'precursor_result_python.csv'
 
-# # Reorder columns to match expected format:
-# # RT columns first, then ProductMz, LibraryIntensity, frag_type, FragmentType
-# rt_columns = [col for col in data.columns if col not in ['ProductMz', 'LibraryIntensity', 'frag_type', 'FragmentType']]
-# other_columns = ['ProductMz', 'LibraryIntensity', 'frag_type', 'FragmentType']
-# ordered_columns = rt_columns + other_columns
+# Reorder columns to match expected format:
+# RT columns first, then ProductMz, LibraryIntensity, frag_type, FragmentType
+rt_columns = [col for col in data.columns if col not in ['ProductMz', 'LibraryIntensity', 'frag_type', 'FragmentType']]
+other_columns = ['ProductMz', 'LibraryIntensity', 'frag_type', 'FragmentType']
+ordered_columns = rt_columns + other_columns
 
-# # Create reordered dataframe
-# data_reordered = data[ordered_columns]
+# Create reordered dataframe
+data_reordered = data[ordered_columns]
 
-# # Save to CSV
-# data_reordered.to_csv(output_csv_path, index=False)
-# print(f"\nData exported to CSV: {output_csv_path}")
-# print(f"CSV file contains {len(data_reordered)} rows and {len(data_reordered.columns)} columns")
+# Save to CSV
+data_reordered.to_csv(output_csv_path, index=False)
+print(f"\nData exported to CSV: {output_csv_path}")
+print(f"CSV file contains {len(data_reordered)} rows and {len(data_reordered.columns)} columns")
 
-# # Print first few rows for verification
-# print("\nFirst 5 rows of exported data:")
-# print(data_reordered.head())
+# Print first few rows for verification
+print("\nFirst 5 rows of exported data:")
+print(data_reordered.head())
 
-# # Print column names for comparison
-# print("\nColumn names in order:")
-# for i, col in enumerate(data_reordered.columns):
-#     print(f"  {i}: {col}")
+# Print column names for comparison
+print("\nColumn names in order:")
+for i, col in enumerate(data_reordered.columns):
+    print(f"  {i}: {col}")
 
-# # Print data types for debugging
-# print("\nData types:")
-# print(data_reordered.dtypes)
+# Print data types for debugging
+print("\nData types:")
+print(data_reordered.dtypes)
 
-# # Additional verification: check for any differences in data format
-# print("\nData summary:")
-# print(f"Number of RT columns: {len(rt_columns)}")
-# print(f"Number of rows with frag_type 1: {len(data_reordered[data_reordered['frag_type'] == 1])}")
-# print(f"Number of rows with frag_type 2: {len(data_reordered[data_reordered['frag_type'] == 2])}")
-# print(f"Number of rows with frag_type 5: {len(data_reordered[data_reordered['frag_type'] == 5])}")
+# Additional verification: check for any differences in data format
+print("\nData summary:")
+print(f"Number of RT columns: {len(rt_columns)}")
+print(f"Number of rows with frag_type 1: {len(data_reordered[data_reordered['frag_type'] == 1])}")
+print(f"Number of rows with frag_type 2: {len(data_reordered[data_reordered['frag_type'] == 2])}")
+print(f"Number of rows with frag_type 5: {len(data_reordered[data_reordered['frag_type'] == 5])}")
 
-# # Export filtered data (frag_type 1 or 2 only) for plotting comparison
-# filtered_for_plot = data_reordered[data_reordered['frag_type'].isin([1, 2])]
-# filtered_for_plot.to_csv('precursor_result_python_filtered.csv', index=False)
-# print(f"\nFiltered data (frag_type 1 or 2) exported to: precursor_result_python_filtered.csv")
-# print(f"Filtered CSV contains {len(filtered_for_plot)} rows")
+# Export filtered data (frag_type 1 or 2 only) for plotting comparison
+filtered_for_plot = data_reordered[data_reordered['frag_type'].isin([1, 2])]
+filtered_for_plot.to_csv('precursor_result_python_filtered.csv', index=False)
+print(f"\nFiltered data (frag_type 1 or 2) exported to: precursor_result_python_filtered.csv")
+print(f"Filtered CSV contains {len(filtered_for_plot)} rows")

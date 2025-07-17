@@ -257,7 +257,7 @@ def plot_intensity_comparison(csv_file_path, precursor_name="Unknown Precursor",
 # 主函数
 if __name__ == "__main__":
     # 设置文件路径
-    csv_file = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/20250714/timstof-slice-optimize/LLIYGASTR2_final_dataframe.csv"
+    csv_file = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/20250716/包含-im-rt的结果/(UniMod:1)AAAMDVDTPSGTNSGAGK2_rt48.63_im1.106_final_dataframe.csv"
     
     # 基本的peak group图
     print("生成Peak Group图...")
@@ -268,13 +268,13 @@ if __name__ == "__main__":
         save_path="peak_group_plot.png"  # 可选：保存图片
     )
     
-    # 碎片强度比较图
-    print("\n生成碎片强度比较图...")
-    fig2, axes2 = plot_intensity_comparison(
-        csv_file,
-        precursor_name="LLIYGASTR2",
-        specific_fragments=None  # None表示自动选择强度最高的10个
-    )
+    # # 碎片强度比较图
+    # print("\n生成碎片强度比较图...")
+    # fig2, axes2 = plot_intensity_comparison(
+    #     csv_file,
+    #     precursor_name="LLIYGASTR2",
+    #     specific_fragments=None  # None表示自动选择强度最高的10个
+    # )
     
     # 额外的分析：打印数据摘要
     print("\n数据摘要：")

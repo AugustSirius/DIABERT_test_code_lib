@@ -1,22 +1,292 @@
-use std::collections::{HashMap, HashSet};
-use ndarray::{Array1, Array2, Array3, s};
+use std::collections::HashMap;
+use ndarray::{Array2, Array3, s};
 use std::cmp::Ordering;
 use std::error::Error;
-use timsrust::converters::ConvertableDomain;
 use polars::prelude::*;
 use std::fs::File;
 use rayon::prelude::*;
 use csv::ReaderBuilder;
+use std::path::Path;
+use std::sync::Arc;
+use timsrust::{converters::ConvertableDomain, readers::{FrameReader, MetadataReader}, MSLevel};
+use serde::{Serialize, Deserialize};
 
-// TimsTOF数据结构
-#[derive(Debug, Clone)]
-pub struct TimsTOFData {
-    pub rt_values_min: Vec<f64>,
-    pub mobility_values: Vec<f64>,
-    pub mz_values: Vec<f64>,
+// ============================================================================
+// TimsTOF 数据读取相关结构体和函数
+// ============================================================================
+
+/// 原始 TimsTOF 数据结构，用于存储从 .d 文件读取的原始数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimsTOFRawData {
+    pub ms1_data: TimsTOFData,
+    pub ms2_windows: Vec<((f32, f32), TimsTOFData)>,
+}
+
+/// 读取 TimsTOF .d 文件夹，返回原始数据
+pub fn read_timstof_data(d_folder: &Path) -> Result<TimsTOFRawData, Box<dyn Error>> {
+    let tdf_path = d_folder.join("analysis.tdf");
+    let meta = MetadataReader::new(&tdf_path)?;
+    let mz_cv = Arc::new(meta.mz_converter);
+    let im_cv = Arc::new(meta.im_converter);
+    
+    let frames = FrameReader::new(d_folder)?;
+    let n_frames = frames.len();
+    
+    let splits: Vec<FrameSplit> = (0..n_frames).into_par_iter().map(|idx| {
+        let frame = frames.get(idx).expect("frame read");
+        let rt_min = frame.rt_in_seconds as f32 / 60.0;
+        let mut ms1 = TimsTOFData::new();
+        let mut ms2_pairs: Vec<((u32,u32), TimsTOFData)> = Vec::new();
+        
+        match frame.ms_level {
+            MSLevel::MS1 => {
+                let n_peaks = frame.tof_indices.len();
+                ms1 = TimsTOFData::with_capacity(n_peaks);
+                for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                    let mz = mz_cv.convert(tof as f64) as f32;
+                    let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                    let im = im_cv.convert(scan as f64) as f32;
+                    ms1.rt_values_min.push(rt_min);
+                    ms1.mobility_values.push(im);
+                    ms1.mz_values.push(mz);
+                    ms1.intensity_values.push(intensity);
+                    ms1.frame_indices.push(frame.index as u32);
+                    ms1.scan_indices.push(scan as u32);
+                }
+            }
+            MSLevel::MS2 => {
+                let qs = &frame.quadrupole_settings;
+                ms2_pairs.reserve(qs.isolation_mz.len());
+                for win in 0..qs.isolation_mz.len() {
+                    if win >= qs.isolation_width.len() { break; }
+                    let prec_mz = qs.isolation_mz[win] as f32;
+                    let width = qs.isolation_width[win] as f32;
+                    let low = prec_mz - width * 0.5;
+                    let high = prec_mz + width * 0.5;
+                    let key = (quantize(low), quantize(high));
+                    
+                    let mut td = TimsTOFData::new();
+                    for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                        let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                        if scan < qs.scan_starts[win] || scan > qs.scan_ends[win] { continue; }
+                        let mz = mz_cv.convert(tof as f64) as f32;
+                        let im = im_cv.convert(scan as f64) as f32;
+                        td.rt_values_min.push(rt_min);
+                        td.mobility_values.push(im);
+                        td.mz_values.push(mz);
+                        td.intensity_values.push(intensity);
+                        td.frame_indices.push(frame.index as u32);
+                        td.scan_indices.push(scan as u32);
+                    }
+                    ms2_pairs.push((key, td));
+                }
+            }
+            _ => {}
+        }
+        FrameSplit { ms1, ms2: ms2_pairs }
+    }).collect();
+    
+    let ms1_size_estimate: usize = splits.par_iter().map(|s| s.ms1.mz_values.len()).sum();
+    let mut global_ms1 = TimsTOFData::with_capacity(ms1_size_estimate);
+    let mut ms2_hash: HashMap<(u32,u32), TimsTOFData> = HashMap::new();
+    
+    for split in splits {
+        global_ms1.rt_values_min.extend(split.ms1.rt_values_min);
+        global_ms1.mobility_values.extend(split.ms1.mobility_values);
+        global_ms1.mz_values.extend(split.ms1.mz_values);
+        global_ms1.intensity_values.extend(split.ms1.intensity_values);
+        global_ms1.frame_indices.extend(split.ms1.frame_indices);
+        global_ms1.scan_indices.extend(split.ms1.scan_indices);
+        
+        for (key, mut td) in split.ms2 {
+            ms2_hash.entry(key).or_insert_with(TimsTOFData::new).merge_from(&mut td);
+        }
+    }
+    
+    let mut ms2_vec = Vec::with_capacity(ms2_hash.len());
+    for ((q_low, q_high), td) in ms2_hash {
+        let low = q_low as f32 / 10_000.0;
+        let high = q_high as f32 / 10_000.0;
+        ms2_vec.push(((low, high), td));
+    }
+    
+    Ok(TimsTOFRawData {
+        ms1_data: global_ms1,
+        ms2_windows: ms2_vec,
+    })
+}
+
+// ============================================================================
+// Optimized IndexedTimsTOFData with all u32 indices
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedTimsTOFData {
+    pub rt_values_min: Vec<f32>,
+    pub mobility_values: Vec<f32>,
+    pub mz_values: Vec<f32>,
     pub intensity_values: Vec<u32>,
-    pub frame_indices: Vec<usize>,
-    pub scan_indices: Vec<usize>,
+    pub frame_indices: Vec<u32>,
+    pub scan_indices: Vec<u32>,
+}
+
+impl IndexedTimsTOFData {
+    /// Empty constructor
+    pub fn new() -> Self {
+        Self {
+            rt_values_min: Vec::new(),
+            mobility_values: Vec::new(),
+            mz_values: Vec::new(),
+            intensity_values: Vec::new(),
+            frame_indices: Vec::new(),
+            scan_indices: Vec::new(),
+        }
+    }
+
+    /// Build once ► all columns reordered into the same m/z-ascending order.
+    pub fn from_timstof_data(data: TimsTOFData) -> Self {
+        let n_peaks = data.mz_values.len();
+        
+        // 1. Build permutation for m/z sorting
+        let mut order: Vec<usize> = (0..n_peaks).collect();
+        order.sort_by(|&a, &b| data.mz_values[a].partial_cmp(&data.mz_values[b]).unwrap());
+
+        // 2. Helper functions to reorder in one pass
+        fn reorder_f32(src: &[f32], ord: &[usize]) -> Vec<f32> {
+            ord.iter().map(|&i| src[i]).collect()
+        }
+        
+        fn reorder_u32(src: &[u32], ord: &[usize]) -> Vec<u32> {
+            ord.iter().map(|&i| src[i]).collect()
+        }
+
+        // 3. Apply permutation to all columns
+        Self {
+            rt_values_min: reorder_f32(&data.rt_values_min, &order),
+            mobility_values: reorder_f32(&data.mobility_values, &order),
+            mz_values: reorder_f32(&data.mz_values, &order),
+            intensity_values: reorder_u32(&data.intensity_values, &order),
+            frame_indices: reorder_u32(&data.frame_indices, &order),
+            scan_indices: reorder_u32(&data.scan_indices, &order),
+        }
+    }
+
+    /// Locate the slice boundaries (binary search)
+    #[inline]
+    fn range_indices(&self, mz_min: f32, mz_max: f32) -> std::ops::Range<usize> {
+        let start = self.mz_values.partition_point(|&x| x < mz_min);
+        let end = self.mz_values.partition_point(|&x| x <= mz_max);
+        start..end
+    }
+
+    /// Extract peaks whose m/z is within [mz_min, mz_max]
+    pub fn slice_by_mz_range(&self, mz_min: f32, mz_max: f32) -> TimsTOFData {
+        let range = self.range_indices(mz_min, mz_max);
+        let cap = range.len();
+        let mut td = TimsTOFData::with_capacity(cap);
+
+        td.rt_values_min.extend_from_slice(&self.rt_values_min[range.clone()]);
+        td.mobility_values.extend_from_slice(&self.mobility_values[range.clone()]);
+        td.mz_values.extend_from_slice(&self.mz_values[range.clone()]);
+        td.intensity_values.extend_from_slice(&self.intensity_values[range.clone()]);
+        td.frame_indices.extend_from_slice(&self.frame_indices[range.clone()]);
+        td.scan_indices.extend_from_slice(&self.scan_indices[range]);
+        td
+    }
+
+    /// Combined m/z and ion mobility range filtering (NEW - optimized)
+    pub fn slice_by_mz_im_range(&self, mz_min: f32, mz_max: f32, im_min: f32, im_max: f32) -> TimsTOFData {
+        let range = self.range_indices(mz_min, mz_max);
+        
+        // Use parallel filtering for ion mobility
+        let indices: Vec<usize> = (range.start..range.end)
+            .into_par_iter()
+            .filter(|&i| {
+                let im = self.mobility_values[i];
+                im >= im_min && im <= im_max
+            })
+            .collect();
+        
+        let cap = indices.len();
+        let mut td = TimsTOFData::with_capacity(cap);
+        
+        // Copy only the filtered indices
+        for &i in &indices {
+            td.rt_values_min.push(self.rt_values_min[i]);
+            td.mobility_values.push(self.mobility_values[i]);
+            td.mz_values.push(self.mz_values[i]);
+            td.intensity_values.push(self.intensity_values[i]);
+            td.frame_indices.push(self.frame_indices[i]);
+            td.scan_indices.push(self.scan_indices[i]);
+        }
+        
+        td
+    }
+
+    /// Multiply m/z by 1000 (monotonic transform keeps sorting)
+    pub fn convert_mz_to_integer(&mut self) {
+        self.mz_values.iter_mut().for_each(|v| *v = (*v * 1000.0).ceil());
+    }
+
+    /// Ion mobility filtering (now uses slice_by_mz_im_range internally)
+    pub fn filter_by_im_range(&self, im_min: f32, im_max: f32) -> TimsTOFData {
+        // Use the full m/z range with IM filtering
+        self.slice_by_mz_im_range(f32::NEG_INFINITY, f32::INFINITY, im_min, im_max)
+    }
+}
+
+/// 构建索引数据
+pub fn build_indexed_data(raw_data: TimsTOFRawData) -> Result<(IndexedTimsTOFData, Vec<((f32, f32), IndexedTimsTOFData)>), Box<dyn Error>> {
+    // 为 MS1 数据构建索引
+    let ms1_indexed = IndexedTimsTOFData::from_timstof_data(raw_data.ms1_data);
+    
+    // 为 MS2 窗口构建索引
+    let ms2_indexed_pairs: Vec<((f32, f32), IndexedTimsTOFData)> = raw_data.ms2_windows
+        .into_par_iter()
+        .map(|((low, high), data)| ((low, high), IndexedTimsTOFData::from_timstof_data(data)))
+        .collect();
+    
+    Ok((ms1_indexed, ms2_indexed_pairs))
+}
+
+// ============================================================================
+// 原有的数据结构和工具函数
+// ============================================================================
+
+#[inline]
+pub fn quantize(x: f32) -> u32 { 
+    (x * 10_000.0).round() as u32 
+}
+
+pub struct FrameSplit {
+    pub ms1: TimsTOFData,
+    pub ms2: Vec<((u32, u32), TimsTOFData)>,
+}
+
+pub trait MergeFrom { 
+    fn merge_from(&mut self, other: &mut Self); 
+}
+
+impl MergeFrom for TimsTOFData {
+    fn merge_from(&mut self, other: &mut Self) {
+        self.rt_values_min.append(&mut other.rt_values_min);
+        self.mobility_values.append(&mut other.mobility_values);
+        self.mz_values.append(&mut other.mz_values);
+        self.intensity_values.append(&mut other.intensity_values);
+        self.frame_indices.append(&mut other.frame_indices);
+        self.scan_indices.append(&mut other.scan_indices);
+    }
+}
+
+// TimsTOF数据结构 - now with u32 indices
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimsTOFData {
+    pub rt_values_min: Vec<f32>,
+    pub mobility_values: Vec<f32>,
+    pub mz_values: Vec<f32>,
+    pub intensity_values: Vec<u32>,
+    pub frame_indices: Vec<u32>,    // Changed from Vec<usize> to Vec<u32>
+    pub scan_indices: Vec<u32>,      // Changed from Vec<usize> to Vec<u32>
 }
 
 impl TimsTOFData {
@@ -31,16 +301,16 @@ impl TimsTOFData {
         }
     }
     
-    // pub fn with_capacity(capacity: usize) -> Self {
-    //     Self {
-    //         rt_values_min: Vec::with_capacity(capacity),
-    //         mobility_values: Vec::with_capacity(capacity),
-    //         mz_values: Vec::with_capacity(capacity),
-    //         intensity_values: Vec::with_capacity(capacity),
-    //         frame_indices: Vec::with_capacity(capacity),
-    //         scan_indices: Vec::with_capacity(capacity),
-    //     }
-    // }
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rt_values_min: Vec::with_capacity(capacity),
+            mobility_values: Vec::with_capacity(capacity),
+            mz_values: Vec::with_capacity(capacity),
+            intensity_values: Vec::with_capacity(capacity),
+            frame_indices: Vec::with_capacity(capacity),
+            scan_indices: Vec::with_capacity(capacity),
+        }
+    }
     
     pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
         let mut merged = TimsTOFData::new();
@@ -61,11 +331,11 @@ impl TimsTOFData {
 // 常量定义
 pub const MS1_ISOTOPE_COUNT: usize = 6;
 pub const FRAGMENT_VARIANTS: usize = 3;
-pub const MS1_TYPE_MARKER: f64 = 5.0;
-pub const MS1_FRAGMENT_TYPE: f64 = 1.0;
-pub const VARIANT_ORIGINAL: f64 = 2.0;
-pub const VARIANT_LIGHT: f64 = 3.0;
-pub const VARIANT_HEAVY: f64 = 4.0;
+pub const MS1_TYPE_MARKER: f32 = 5.0;
+pub const MS1_FRAGMENT_TYPE: f32 = 1.0;
+pub const VARIANT_ORIGINAL: f32 = 2.0;
+pub const VARIANT_LIGHT: f32 = 3.0;
+pub const VARIANT_HEAVY: f32 = 4.0;
 
 // 库列名映射结构体
 #[derive(Debug, Clone)]
@@ -105,7 +375,7 @@ impl Default for LibCols {
     }
 }
 
-pub type MSDataArray = Vec<Vec<f64>>;
+pub type MSDataArray = Vec<Vec<f32>>;
 
 #[derive(Debug, Clone)]
 pub struct LibraryRecord {
@@ -136,35 +406,7 @@ pub fn find_scan_for_index(index: usize, scan_offsets: &[usize]) -> usize {
     scan_offsets.len() - 1
 }
 
-pub fn get_rt_list(mut lst: Vec<f64>, target: f64) -> Vec<f64> {
-    lst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    
-    if lst.is_empty() {
-        return vec![0.0; 48];
-    }
-    
-    if lst.len() <= 48 {
-        let mut result = lst;
-        result.resize(48, 0.0);
-        return result;
-    }
-    
-    let closest_idx = lst.iter()
-        .enumerate()
-        .min_by_key(|(_, &val)| ((val - target).abs() * 1e9) as i64)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-    
-    let start = if closest_idx >= 24 {
-        (closest_idx - 24).min(lst.len() - 48)
-    } else {
-        0
-    };
-    
-    lst[start..start + 48].to_vec()
-}
-
-pub fn intercept_frags_sort(mut fragment_list: Vec<f64>, max_length: usize) -> Vec<f64> {
+pub fn intercept_frags_sort(mut fragment_list: Vec<f32>, max_length: usize) -> Vec<f32> {
     fragment_list.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
     fragment_list.truncate(max_length);
     fragment_list
@@ -215,56 +457,9 @@ pub fn get_lib_col_dict() -> HashMap<&'static str, &'static str> {
     lib_col_dict
 }
 
-pub fn build_ext_ms1_matrix(ms1_data_tensor: &Array3<f32>, device: &str) -> Array3<f32> {
-    let shape = ms1_data_tensor.shape();
-    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
-    
-    let mut ext_matrix = Array3::<f32>::zeros((batch, rows, 4));
-    
-    for i in 0..batch {
-        for j in 0..rows {
-            ext_matrix[[i, j, 0]] = ms1_data_tensor[[i, j, 0]];
-            if shape[2] > 3 {
-                ext_matrix[[i, j, 1]] = ms1_data_tensor[[i, j, 3]];
-            }
-            if shape[2] > 8 {
-                ext_matrix[[i, j, 2]] = ms1_data_tensor[[i, j, 8]];
-            }
-            if shape[2] > 4 {
-                ext_matrix[[i, j, 3]] = ms1_data_tensor[[i, j, 4]];
-            }
-        }
-    }
-    
-    ext_matrix
-}
-
-pub fn build_ext_ms2_matrix(ms2_data_tensor: &Array3<f32>, device: &str) -> Array3<f32> {
-    let shape = ms2_data_tensor.shape();
-    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
-    
-    let mut ext_matrix = Array3::<f32>::zeros((batch, rows, 4));
-    
-    for i in 0..batch {
-        for j in 0..rows {
-            ext_matrix[[i, j, 0]] = ms2_data_tensor[[i, j, 0]];
-            if shape[2] > 3 {
-                ext_matrix[[i, j, 1]] = ms2_data_tensor[[i, j, 3]];
-            }
-            if shape[2] > 8 {
-                ext_matrix[[i, j, 2]] = ms2_data_tensor[[i, j, 8]];
-            }
-            if shape[2] > 4 {
-                ext_matrix[[i, j, 3]] = ms2_data_tensor[[i, j, 4]];
-            }
-        }
-    }
-    
-    ext_matrix
-}
-
+// ... 继续包含所有其他的辅助函数 ...
 // Helper functions for MS data processing
-pub fn build_ms1_data(fragment_list: &[Vec<f64>], isotope_range: f64, max_mz: f64) -> MSDataArray {
+pub fn build_ms1_data(fragment_list: &[Vec<f32>], isotope_range: f32, max_mz: f32) -> MSDataArray {
     let first_fragment = &fragment_list[0];
     let charge = first_fragment[1];
     let precursor_mz = first_fragment[5];
@@ -272,8 +467,8 @@ pub fn build_ms1_data(fragment_list: &[Vec<f64>], isotope_range: f64, max_mz: f6
     let available_range = (max_mz - precursor_mz) * charge;
     let iso_shift_max = (isotope_range.min(available_range) as i32) + 1;
     
-    let mut isotope_mz_list: Vec<f64> = (0..iso_shift_max)
-        .map(|iso_shift| precursor_mz + (iso_shift as f64) / charge)
+    let mut isotope_mz_list: Vec<f32> = (0..iso_shift_max)
+        .map(|iso_shift| precursor_mz + (iso_shift as f32) / charge)
         .collect();
     
     isotope_mz_list = intercept_frags_sort(isotope_mz_list, MS1_ISOTOPE_COUNT);
@@ -301,7 +496,7 @@ pub fn build_ms1_data(fragment_list: &[Vec<f64>], isotope_range: f64, max_mz: f6
     ms1_data
 }
 
-pub fn build_ms2_data(fragment_list: &[Vec<f64>], max_fragment_num: usize) -> MSDataArray {
+pub fn build_ms2_data(fragment_list: &[Vec<f32>], max_fragment_num: usize) -> MSDataArray {
     let total_count = max_fragment_num * FRAGMENT_VARIANTS;
     let fragment_num = fragment_list.len();
     
@@ -356,27 +551,27 @@ pub fn build_ms2_data(fragment_list: &[Vec<f64>], max_fragment_num: usize) -> MS
     complete_data
 }
 
-pub fn build_precursor_info(fragment_list: &[Vec<f64>]) -> Vec<f64> {
+pub fn build_precursor_info(fragment_list: &[Vec<f32>]) -> Vec<f32> {
     let first_fragment = &fragment_list[0];
     vec![
         first_fragment[7],
         first_fragment[5],
         first_fragment[1],
         first_fragment[6],
-        fragment_list.len() as f64,
+        fragment_list.len() as f32,
         0.0,
     ]
 }
 
 pub fn format_ms_data(
-    fragment_list: &[Vec<f64>], 
-    isotope_range: f64, 
-    max_mz: f64, 
+    fragment_list: &[Vec<f32>], 
+    isotope_range: f32, 
+    max_mz: f32, 
     max_fragment: usize
-) -> (MSDataArray, MSDataArray, Vec<f64>) {
+) -> (MSDataArray, MSDataArray, Vec<f32>) {
     let ms1_data = build_ms1_data(fragment_list, isotope_range, max_mz);
     
-    let fragment_list_subset: Vec<Vec<f64>> = fragment_list.iter()
+    let fragment_list_subset: Vec<Vec<f32>> = fragment_list.iter()
         .map(|row| row[..6].to_vec())
         .collect();
     
@@ -399,10 +594,10 @@ pub fn format_ms_data(
 pub fn build_lib_matrix(
     lib_data: &[LibraryRecord],
     lib_cols: &LibCols,
-    iso_range: f64,
-    mz_max: f64,
+    iso_range: f32,
+    mz_max: f32,
     max_fragment: usize,
-) -> Result<(Vec<Vec<String>>, Vec<MSDataArray>, Vec<MSDataArray>, Vec<Vec<f64>>), Box<dyn Error>> {
+) -> Result<(Vec<Vec<String>>, Vec<MSDataArray>, Vec<MSDataArray>, Vec<Vec<f32>>), Box<dyn Error>> {
     let precursor_ids: Vec<String> = lib_data.iter()
         .map(|record| record.transition_group_id.clone())
         .collect();
@@ -433,16 +628,16 @@ pub fn build_lib_matrix(
             let record = &lib_data[idx];
             
             let fragment_row = vec![
-                record.product_mz.parse::<f64>().unwrap_or(0.0),
-                record.precursor_charge.parse::<f64>().unwrap_or(0.0),
-                record.fragment_charge.parse::<f64>().unwrap_or(0.0),
-                record.library_intensity.parse::<f64>().unwrap_or(0.0),
-                record.fragment_type.parse::<f64>().unwrap_or(0.0),
-                record.precursor_mz.parse::<f64>().unwrap_or(0.0),
-                record.tr_recalibrated.parse::<f64>().unwrap_or(0.0),
-                record.peptide_sequence.len() as f64,
-                record.decoy.parse::<f64>().unwrap_or(0.0),
-                record.transition_group_id.len() as f64,
+                record.product_mz.parse::<f32>().unwrap_or(0.0),
+                record.precursor_charge.parse::<f32>().unwrap_or(0.0),
+                record.fragment_charge.parse::<f32>().unwrap_or(0.0),
+                record.library_intensity.parse::<f32>().unwrap_or(0.0),
+                record.fragment_type.parse::<f32>().unwrap_or(0.0),
+                record.precursor_mz.parse::<f32>().unwrap_or(0.0),
+                record.tr_recalibrated.parse::<f32>().unwrap_or(0.0),
+                record.peptide_sequence.len() as f32,
+                record.decoy.parse::<f32>().unwrap_or(0.0),
+                record.transition_group_id.len() as f32,
             ];
             group_fragments.push(fragment_row);
         }
@@ -476,7 +671,7 @@ pub fn build_precursors_matrix_step1(
     for (i, ms1_data) in ms1_data_list.iter().enumerate() {
         for (j, row) in ms1_data.iter().enumerate() {
             for (k, &val) in row.iter().enumerate() {
-                ms1_tensor[[i, j, k]] = val as f32;
+                ms1_tensor[[i, j, k]] = val;
             }
         }
     }
@@ -485,7 +680,7 @@ pub fn build_precursors_matrix_step1(
     for (i, ms2_data) in ms2_data_list.iter().enumerate() {
         for (j, row) in ms2_data.iter().enumerate() {
             for (k, &val) in row.iter().enumerate() {
-                ms2_tensor[[i, j, k]] = val as f32;
+                ms2_tensor[[i, j, k]] = val;
             }
         }
     }
@@ -833,46 +1028,7 @@ pub fn build_precursors_matrix_step3(
     Ok((re_ms1_data_tensor, re_ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list))
 }
 
-pub fn build_frag_info(
-    ms1_data_tensor: &Array3<f32>,
-    ms2_data_tensor: &Array3<f32>,
-    frag_repeat_num: usize,
-    device: &str
-) -> Array3<f32> {
-    let ext_ms1_precursors_frag_rt_matrix = build_ext_ms1_matrix(ms1_data_tensor, device);
-    let ext_ms2_precursors_frag_rt_matrix = build_ext_ms2_matrix(ms2_data_tensor, device);
-    
-    let ms1_shape = ext_ms1_precursors_frag_rt_matrix.shape().to_vec();
-    let ms2_shape = ext_ms2_precursors_frag_rt_matrix.shape().to_vec();
-    
-    let batch = ms1_shape[0];
-    let ms1_rows = ms1_shape[1];
-    let ms2_rows = ms2_shape[1];
-    
-    let orig_ms1_shape = ms1_data_tensor.shape();
-    let orig_ms2_shape = ms2_data_tensor.shape();
-    let ms1_frag_count = orig_ms1_shape[1];
-    let ms2_frag_count = orig_ms2_shape[1];
-    
-    let total_frag_count = ms1_frag_count + ms2_frag_count;
-    let mut frag_info = Array3::<f32>::zeros((batch, total_frag_count, 4));
-    
-    for i in 0..batch {
-        for j in 0..ms1_frag_count {
-            for k in 0..4 {
-                frag_info[[i, j, k]] = ext_ms1_precursors_frag_rt_matrix[[i, j, k]];
-            }
-        }
-        
-        for j in 0..ms2_frag_count {
-            for k in 0..4 {
-                frag_info[[i, ms1_frag_count + j, k]] = ext_ms2_precursors_frag_rt_matrix[[i, j, k]];
-            }
-        }
-    }
-    
-    frag_info
-}
+
 
 // Functions moved from main.rs
 pub fn read_parquet_with_polars(file_path: &str) -> PolarsResult<DataFrame> {
@@ -889,8 +1045,8 @@ pub fn library_records_to_dataframe(records: Vec<LibraryRecord>) -> PolarsResult
     let mut product_mzs = Vec::with_capacity(records.len());
     for record in records {
         transition_group_ids.push(record.transition_group_id);
-        precursor_mzs.push(record.precursor_mz.parse::<f64>().unwrap_or(f64::NAN));
-        product_mzs.push(record.product_mz.parse::<f64>().unwrap_or(f64::NAN));
+        precursor_mzs.push(record.precursor_mz.parse::<f32>().unwrap_or(f32::NAN));
+        product_mzs.push(record.product_mz.parse::<f32>().unwrap_or(f32::NAN));
     }
     let df = DataFrame::new(vec![
         Series::new("transition_group_id", transition_group_ids),
@@ -1052,19 +1208,19 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
     Ok(records)
 }
 
-pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>, HashMap<String, f64>)> {
+pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f32>, HashMap<String, f32>)> {
     let id_col = df.column("transition_group_id")?;
     let id_vec = id_col.str()?.into_iter()
         .map(|opt| opt.unwrap_or("").to_string())
         .collect::<Vec<String>>();
     
     let rt_col = df.column("RT")?;
-    let rt_vec: Vec<f64> = match rt_col.dtype() {
+    let rt_vec: Vec<f32> = match rt_col.dtype() {
         DataType::Float32 => rt_col.f32()?.into_iter()
-            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .map(|opt| opt.unwrap_or(f32::NAN))
             .collect(),
         DataType::Float64 => rt_col.f64()?.into_iter()
-            .map(|opt| opt.unwrap_or(f64::NAN))
+            .map(|opt| opt.map(|v| v as f32).unwrap_or(f32::NAN))
             .collect(),
         _ => return Err(PolarsError::SchemaMismatch(
             format!("RT column type is not float: {:?}", rt_col.dtype()).into()
@@ -1072,12 +1228,12 @@ pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>,
     };
     
     let im_col = df.column("IM")?;
-    let im_vec: Vec<f64> = match im_col.dtype() {
+    let im_vec: Vec<f32> = match im_col.dtype() {
         DataType::Float32 => im_col.f32()?.into_iter()
-            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .map(|opt| opt.unwrap_or(f32::NAN))
             .collect(),
         DataType::Float64 => im_col.f64()?.into_iter()
-            .map(|opt| opt.unwrap_or(f64::NAN))
+            .map(|opt| opt.map(|v| v as f32).unwrap_or(f32::NAN))
             .collect(),
         _ => return Err(PolarsError::SchemaMismatch(
             format!("IM column type is not float: {:?}", im_col.dtype()).into()
@@ -1093,4 +1249,123 @@ pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>,
     }
     
     Ok((rt_dict, im_dict))
+}
+
+// Add these functions to utils.rs after the existing code
+
+pub fn get_rt_list(mut lst: Vec<f32>, target: f32) -> Vec<f32> {
+    lst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    
+    if lst.is_empty() {
+        return vec![0.0; 48];
+    }
+    
+    if lst.len() <= 48 {
+        let mut result = lst;
+        result.resize(48, 0.0);
+        return result;
+    }
+    
+    let closest_idx = lst.iter()
+        .enumerate()
+        .min_by_key(|(_, &val)| ((val - target).abs() * 1e9) as i32)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    
+    let start = if closest_idx >= 24 {
+        (closest_idx - 24).min(lst.len() - 48)
+    } else {
+        0
+    };
+    
+    lst[start..start + 48].to_vec()
+}
+
+pub fn build_ext_ms1_matrix(ms1_data_tensor: &Array3<f32>, device: &str) -> Array3<f32> {
+    let shape = ms1_data_tensor.shape();
+    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
+    
+    let mut ext_matrix = Array3::<f32>::zeros((batch, rows, 4));
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            ext_matrix[[i, j, 0]] = ms1_data_tensor[[i, j, 0]];
+            if shape[2] > 3 {
+                ext_matrix[[i, j, 1]] = ms1_data_tensor[[i, j, 3]];
+            }
+            if shape[2] > 8 {
+                ext_matrix[[i, j, 2]] = ms1_data_tensor[[i, j, 8]];
+            }
+            if shape[2] > 4 {
+                ext_matrix[[i, j, 3]] = ms1_data_tensor[[i, j, 4]];
+            }
+        }
+    }
+    
+    ext_matrix
+}
+
+pub fn build_ext_ms2_matrix(ms2_data_tensor: &Array3<f32>, device: &str) -> Array3<f32> {
+    let shape = ms2_data_tensor.shape();
+    let (batch, rows, _) = (shape[0], shape[1], shape[2]);
+    
+    let mut ext_matrix = Array3::<f32>::zeros((batch, rows, 4));
+    
+    for i in 0..batch {
+        for j in 0..rows {
+            ext_matrix[[i, j, 0]] = ms2_data_tensor[[i, j, 0]];
+            if shape[2] > 3 {
+                ext_matrix[[i, j, 1]] = ms2_data_tensor[[i, j, 3]];
+            }
+            if shape[2] > 8 {
+                ext_matrix[[i, j, 2]] = ms2_data_tensor[[i, j, 8]];
+            }
+            if shape[2] > 4 {
+                ext_matrix[[i, j, 3]] = ms2_data_tensor[[i, j, 4]];
+            }
+        }
+    }
+    
+    ext_matrix
+}
+
+pub fn build_frag_info(
+    ms1_data_tensor: &Array3<f32>,
+    ms2_data_tensor: &Array3<f32>,
+    frag_repeat_num: usize,
+    device: &str
+) -> Array3<f32> {
+    let ext_ms1_precursors_frag_rt_matrix = build_ext_ms1_matrix(ms1_data_tensor, device);
+    let ext_ms2_precursors_frag_rt_matrix = build_ext_ms2_matrix(ms2_data_tensor, device);
+    
+    let ms1_shape = ext_ms1_precursors_frag_rt_matrix.shape().to_vec();
+    let ms2_shape = ext_ms2_precursors_frag_rt_matrix.shape().to_vec();
+    
+    let batch = ms1_shape[0];
+    let ms1_rows = ms1_shape[1];
+    let ms2_rows = ms2_shape[1];
+    
+    let orig_ms1_shape = ms1_data_tensor.shape();
+    let orig_ms2_shape = ms2_data_tensor.shape();
+    let ms1_frag_count = orig_ms1_shape[1];
+    let ms2_frag_count = orig_ms2_shape[1];
+    
+    let total_frag_count = ms1_frag_count + ms2_frag_count;
+    let mut frag_info = Array3::<f32>::zeros((batch, total_frag_count, 4));
+    
+    for i in 0..batch {
+        for j in 0..ms1_frag_count {
+            for k in 0..4 {
+                frag_info[[i, j, k]] = ext_ms1_precursors_frag_rt_matrix[[i, j, k]];
+            }
+        }
+        
+        for j in 0..ms2_frag_count {
+            for k in 0..4 {
+                frag_info[[i, ms1_frag_count + j, k]] = ext_ms2_precursors_frag_rt_matrix[[i, j, k]];
+            }
+        }
+    }
+    
+    frag_info
 }

@@ -257,7 +257,7 @@ def plot_intensity_comparison(csv_file_path, precursor_name="Unknown Precursor",
 # 主函数
 if __name__ == "__main__":
     # 设置文件路径
-    csv_file = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/20250714/timstof-slice-optimize/LLIYGASTR2_final_dataframe.csv"
+    csv_file = "/Users/augustsirius/Desktop/DIABERT_test_code_lib/20250716/timstof/LLIYGASTR2_final_dataframe.csv"
     
     # 基本的peak group图
     print("生成Peak Group图...")

@@ -5,8 +5,9 @@ use std::error::Error;
 use timsrust::converters::ConvertableDomain;
 use polars::prelude::*;
 use std::fs::File;
+use std::io::Write;
 use rayon::prelude::*;
-use csv::ReaderBuilder;
+use csv::{Writer, ReaderBuilder};
 
 // TimsTOF数据结构
 #[derive(Debug, Clone)]
@@ -31,16 +32,22 @@ impl TimsTOFData {
         }
     }
     
-    // pub fn with_capacity(capacity: usize) -> Self {
-    //     Self {
-    //         rt_values_min: Vec::with_capacity(capacity),
-    //         mobility_values: Vec::with_capacity(capacity),
-    //         mz_values: Vec::with_capacity(capacity),
-    //         intensity_values: Vec::with_capacity(capacity),
-    //         frame_indices: Vec::with_capacity(capacity),
-    //         scan_indices: Vec::with_capacity(capacity),
-    //     }
-    // }
+    pub fn filter_by_mz_range(&self, min_mz: f64, max_mz: f64) -> Self {
+        let mut filtered = TimsTOFData::new();
+        
+        for (i, &mz) in self.mz_values.iter().enumerate() {
+            if mz >= min_mz && mz <= max_mz {
+                filtered.rt_values_min.push(self.rt_values_min[i]);
+                filtered.mobility_values.push(self.mobility_values[i]);
+                filtered.mz_values.push(mz);
+                filtered.intensity_values.push(self.intensity_values[i]);
+                filtered.frame_indices.push(self.frame_indices[i]);
+                filtered.scan_indices.push(self.scan_indices[i]);
+            }
+        }
+        
+        filtered
+    }
     
     pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
         let mut merged = TimsTOFData::new();
@@ -55,6 +62,57 @@ impl TimsTOFData {
         }
         
         merged
+    }
+
+    pub fn append(&mut self, other: &mut TimsTOFData) {
+        self.rt_values_min.append(&mut other.rt_values_min);
+        self.mobility_values.append(&mut other.mobility_values);
+        self.mz_values.append(&mut other.mz_values);
+        self.intensity_values.append(&mut other.intensity_values);
+        self.frame_indices.append(&mut other.frame_indices);
+        self.scan_indices.append(&mut other.scan_indices);
+    }
+
+    
+    pub fn to_dataframe(&self) -> PolarsResult<DataFrame> {
+        let all_integers = self.mz_values.iter().all(|&mz| mz.fract() == 0.0);
+        
+        if all_integers {
+            let mz_integers: Vec<i64> = self.mz_values.iter()
+                .map(|&mz| mz as i64)
+                .collect();
+            
+            let df = DataFrame::new(vec![
+                Series::new("rt_values_min", &self.rt_values_min),
+                Series::new("mobility_values", &self.mobility_values),
+                Series::new("mz_values", mz_integers),
+                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
+            ])?;
+            Ok(df)
+        } else {
+            let df = DataFrame::new(vec![
+                Series::new("rt_values_min", &self.rt_values_min),
+                Series::new("mobility_values", &self.mobility_values),
+                Series::new("mz_values", &self.mz_values),
+                Series::new("intensity_values", self.intensity_values.iter().map(|&v| v as f64).collect::<Vec<_>>()),
+            ])?;
+            Ok(df)
+        }
+    }
+}
+
+// 设备类型枚举
+#[derive(Debug, Clone, Copy)]
+pub enum Device {
+    Cpu,
+}
+
+impl Device {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "cpu" => Device::Cpu,
+            _ => Device::Cpu,
+        }
     }
 }
 
@@ -262,6 +320,528 @@ pub fn build_ext_ms2_matrix(ms2_data_tensor: &Array3<f32>, device: &str) -> Arra
     
     ext_matrix
 }
+
+// 未使用的函数
+pub fn build_intensity_matrix(
+    data: &TimsTOFData,
+    extract_width_range_list: &Array2<f32>,
+    frag_moz_matrix: &Array2<f32>,
+    all_rt: &[f64],
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    let n_frags = extract_width_range_list.shape()[0];
+    let n_rt = all_rt.len();
+    
+    let mut frag_rt_matrix = Array2::<f32>::zeros((n_frags, n_rt));
+    
+    for a in 0..n_frags {
+        for (rt_idx, &rt) in all_rt.iter().enumerate() {
+            let mut moz_to_intensity: HashMap<i64, f64> = HashMap::new();
+            
+            for i in 0..data.rt_values_min.len() {
+                if (data.rt_values_min[i] - rt).abs() < 1e-6 {
+                    let mz = data.mz_values[i] as i64;
+                    let intensity = data.intensity_values[i] as f64;
+                    *moz_to_intensity.entry(mz).or_insert(0.0) += intensity;
+                }
+            }
+            
+            let mut mapped_intensities = Array1::<f32>::zeros(extract_width_range_list.shape()[1]);
+            for j in 0..extract_width_range_list.shape()[1] {
+                let moz = extract_width_range_list[[a, j]] as i64;
+                if let Some(&intensity) = moz_to_intensity.get(&moz) {
+                    mapped_intensities[j] = intensity as f32;
+                }
+            }
+            
+            let frag_moz_row = frag_moz_matrix.slice(ndarray::s![a, ..]);
+            let intensity_sum: f32 = frag_moz_row.iter()
+                .zip(mapped_intensities.iter())
+                .map(|(&mask, &intensity)| mask * intensity)
+                .sum();
+            
+            frag_rt_matrix[[a, rt_idx]] = intensity_sum;
+        }
+    }
+    
+    Ok(frag_rt_matrix)
+}
+
+// 未使用的函数
+pub fn process_ms1_frame(
+    frame: &timsrust::Frame,
+    rt_min: f64,
+    ms1_mz_min: f64,
+    ms1_mz_max: f64,
+    mz_converter: &timsrust::converters::Tof2MzConverter,
+    im_converter: &timsrust::converters::Scan2ImConverter,
+    ms1_data: &mut TimsTOFData,
+) {
+    for (peak_idx, (&tof, &intensity)) in frame.tof_indices.iter()
+        .zip(frame.intensities.iter())
+        .enumerate() 
+    {
+        let mz = mz_converter.convert(tof as f64);
+        
+        if mz >= ms1_mz_min && mz <= ms1_mz_max {
+            let scan = find_scan_for_index(peak_idx, &frame.scan_offsets);
+            let im = im_converter.convert(scan as f64);
+            
+            ms1_data.rt_values_min.push(rt_min);
+            ms1_data.mobility_values.push(im);
+            ms1_data.mz_values.push(mz);
+            ms1_data.intensity_values.push(intensity);
+            ms1_data.frame_indices.push(frame.index);
+            ms1_data.scan_indices.push(scan);
+        }
+    }
+}
+
+// 未使用的函数
+pub fn process_ms2_frame(
+    frame: &timsrust::Frame,
+    rt_min: f64,
+    ms1_mz_min: f64,
+    ms1_mz_max: f64,
+    mz_converter: &timsrust::converters::Tof2MzConverter,
+    im_converter: &timsrust::converters::Scan2ImConverter,
+    ms2_windows: &mut HashMap<String, TimsTOFData>,
+) {
+    let quad_settings = &frame.quadrupole_settings;
+    
+    for i in 0..quad_settings.isolation_mz.len() {
+        if i >= quad_settings.isolation_width.len() {
+            break;
+        }
+        
+        let precursor_mz = quad_settings.isolation_mz[i];
+        let isolation_width = quad_settings.isolation_width[i];
+        
+        if precursor_mz < ms1_mz_min - isolation_width/2.0 || 
+           precursor_mz > ms1_mz_max + isolation_width/2.0 {
+            continue;
+        }
+        
+        let window_key = format!("{:.2}_{:.2}", precursor_mz, isolation_width);
+        let window_data = ms2_windows.entry(window_key).or_insert_with(TimsTOFData::new);
+        
+        for (peak_idx, (&tof, &intensity)) in frame.tof_indices.iter()
+            .zip(frame.intensities.iter())
+            .enumerate() 
+        {
+            let scan = find_scan_for_index(peak_idx, &frame.scan_offsets);
+            
+            if scan >= quad_settings.scan_starts[i] && scan <= quad_settings.scan_ends[i] {
+                let mz = mz_converter.convert(tof as f64);
+                let im = im_converter.convert(scan as f64);
+                
+                window_data.rt_values_min.push(rt_min);
+                window_data.mobility_values.push(im);
+                window_data.mz_values.push(mz);
+                window_data.intensity_values.push(intensity);
+                window_data.frame_indices.push(frame.index);
+                window_data.scan_indices.push(scan);
+            }
+        }
+    }
+}
+
+
+
+// ----------------------------- Unused functions -----------------------------
+
+
+fn build_intensity_matrix_optimized(
+    data: &TimsTOFData,
+    extract_width_range_list: &Array2<f32>,
+    frag_moz_matrix: &Array2<f32>,
+    all_rt: &[f64],
+) -> Result<Array2<f32>, Box<dyn Error>> {
+    use std::time::Instant;
+    let start = Instant::now();
+    
+    let n_frags = extract_width_range_list.shape()[0];
+    let n_rt = all_rt.len();
+    
+    let mut unique_mz_set = HashSet::new();
+    
+    for &mz in &data.mz_values {
+        unique_mz_set.insert(mz as i64);
+    }
+    
+    for i in 0..n_frags {
+        for j in 0..extract_width_range_list.shape()[1] {
+            let mz = extract_width_range_list[[i, j]] as i64;
+            if mz > 0 {
+                unique_mz_set.insert(mz);
+            }
+        }
+    }
+    
+    let mut unique_mz: Vec<i64> = unique_mz_set.into_iter().collect();
+    unique_mz.sort_unstable();
+    
+    let mz_to_idx: HashMap<i64, usize> = unique_mz.iter()
+        .enumerate()
+        .map(|(idx, &mz)| (mz, idx))
+        .collect();
+    
+    let rt_to_idx: HashMap<i64, usize> = all_rt.iter()
+        .enumerate()
+        .map(|(idx, &rt)| ((rt * 1e6) as i64, idx))
+        .collect();
+    
+    let mut pivot_matrix = Array2::<f32>::zeros((unique_mz.len(), n_rt));
+    
+    for i in 0..data.rt_values_min.len() {
+        let rt_key = (data.rt_values_min[i] * 1e6) as i64;
+        let mz = data.mz_values[i] as i64;
+        let intensity = data.intensity_values[i] as f32;
+        
+        if let (Some(&rt_idx), Some(&mz_idx)) = (rt_to_idx.get(&rt_key), mz_to_idx.get(&mz)) {
+            pivot_matrix[[mz_idx, rt_idx]] += intensity;
+        }
+    }
+    
+    let mut frag_rt_matrix = Array2::<f32>::zeros((n_frags, n_rt));
+    
+    for a in 0..n_frags {
+        let mut moz_list: Vec<i64> = Vec::new();
+        for j in 0..extract_width_range_list.shape()[1] {
+            let mz = extract_width_range_list[[a, j]] as i64;
+            moz_list.push(mz);
+        }
+        
+        let mut mz_rt_matrix = Array2::<f32>::zeros((moz_list.len(), n_rt));
+        for (j, &mz) in moz_list.iter().enumerate() {
+            if let Some(&mz_idx) = mz_to_idx.get(&mz) {
+                for k in 0..n_rt {
+                    mz_rt_matrix[[j, k]] = pivot_matrix[[mz_idx, k]];
+                }
+            }
+        }
+        
+        for j in 0..moz_list.len() {
+            for k in 0..n_rt {
+                frag_rt_matrix[[a, k]] += frag_moz_matrix[[a, j]] * mz_rt_matrix[[j, k]];
+            }
+        }
+    }
+    
+    Ok(frag_rt_matrix)
+}
+
+
+
+pub fn export_polars_to_csv(df: &mut DataFrame, output_path: &str) -> PolarsResult<()> {
+    let mut file = File::create(output_path)?;
+    CsvWriter::new(&mut file).include_header(true).finish(df)?;
+    Ok(())
+}
+
+
+// ----------------------------- End of unused functions -----------------------------
+
+// ----------------------------- Moved functions from main.rs -----------------------------
+
+pub fn read_parquet_with_polars(file_path: &str) -> PolarsResult<DataFrame> {
+    let file = File::open(file_path)?;
+    let mut df = ParquetReader::new(file).finish()?;
+    let new_col = df.column("Precursor.Id")?.clone().with_name("transition_group_id");
+    df.with_column(new_col)?;
+    Ok(df)
+}
+
+pub fn export_to_csv(records: &[LibraryRecord], output_path: &str) -> Result<(), Box<dyn Error>> {
+    let file = File::create(output_path)?;
+    let mut wtr = Writer::from_writer(file);
+    wtr.write_record(&[
+        "transition_group_id", "PeptideSequence", "FullUniModPeptideName", "PrecursorCharge", "PrecursorMz",
+        "ProductMz", "FragmentType", "LibraryIntensity", "ProteinID", "Gene", "decoy"
+    ])?;
+    for record in records {
+        wtr.write_record(&[
+            &record.transition_group_id, &record.peptide_sequence, &record.full_unimod_peptide_name,
+            &record.precursor_charge, &record.precursor_mz, &record.product_mz, &record.fragment_type,
+            &record.library_intensity, &record.protein_id, &record.gene, &record.decoy,
+        ])?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+pub fn library_records_to_dataframe(records: Vec<LibraryRecord>) -> PolarsResult<DataFrame> {
+    let mut transition_group_ids = Vec::with_capacity(records.len());
+    let mut precursor_mzs = Vec::with_capacity(records.len());
+    let mut product_mzs = Vec::with_capacity(records.len());
+    for record in records {
+        transition_group_ids.push(record.transition_group_id);
+        precursor_mzs.push(record.precursor_mz.parse::<f64>().unwrap_or(f64::NAN));
+        product_mzs.push(record.product_mz.parse::<f64>().unwrap_or(f64::NAN));
+    }
+    let df = DataFrame::new(vec![
+        Series::new("transition_group_id", transition_group_ids),
+        Series::new("PrecursorMz", precursor_mzs),
+        Series::new("ProductMz", product_mzs),
+    ])?;
+    Ok(df)
+}
+
+pub fn merge_library_and_report(library_df: DataFrame, report_df: DataFrame) -> PolarsResult<DataFrame> {
+    let report_selected = report_df.select(["transition_group_id", "RT", "IM", "iIM"])?;
+    let merged = library_df.join(&report_selected, ["transition_group_id"], ["transition_group_id"], JoinArgs::new(JoinType::Left))?;
+    let rt_col = merged.column("RT")?;
+    let mask = rt_col.is_not_null();
+    let filtered = merged.filter(&mask)?;
+    let reordered = filtered.select(["transition_group_id", "PrecursorMz", "ProductMz", "RT", "IM", "iIM"])?;
+    Ok(reordered)
+}
+
+pub fn get_unique_precursor_ids(diann_result: &DataFrame) -> PolarsResult<DataFrame> {
+    let unique_df = diann_result.unique(Some(&["transition_group_id".to_string()]), UniqueKeepStrategy::First, None)?;
+    let selected_df = unique_df.select(["transition_group_id", "RT", "IM"])?;
+    Ok(selected_df)
+}
+
+pub fn create_precursor_feat(
+    precursor_info_list: &[Vec<f64>],
+    precursors_list: &[Vec<String>],
+    assay_rt_kept_dict: &HashMap<String, f64>,
+    assay_im_kept_dict: &HashMap<String, f64>,
+) -> Result<Array2<f64>, Box<dyn Error>> {
+    let n_precursors = precursor_info_list.len();
+    if n_precursors == 0 {
+        return Err("前体信息列表为空".into());
+    }
+    
+    let mut precursor_feat = Array2::<f64>::zeros((n_precursors, 8));
+    
+    for (i, (info, precursor)) in precursor_info_list.iter().zip(precursors_list.iter()).enumerate() {
+        for j in 0..5.min(info.len()) {
+            precursor_feat[[i, j]] = info[j];
+        }
+        
+        if let Some(&im) = assay_im_kept_dict.get(&precursor[0]) {
+            precursor_feat[[i, 5]] = im;
+        } else {
+            precursor_feat[[i, 5]] = 0.0;
+        }
+        
+        if let Some(&rt) = assay_rt_kept_dict.get(&precursor[0]) {
+            precursor_feat[[i, 6]] = rt;
+        } else {
+            precursor_feat[[i, 6]] = 0.0;
+        }
+        
+        precursor_feat[[i, 7]] = 0.0;
+    }
+    
+    Ok(precursor_feat)
+}
+
+pub fn filter_library_by_precursor_ids(library: &[LibraryRecord], precursor_id_list: &[String]) -> Vec<LibraryRecord> {
+    let id_set: HashSet<&String> = precursor_id_list.iter().collect();
+    let filtered: Vec<LibraryRecord> = library.par_iter().filter(|record| id_set.contains(&record.transition_group_id)).cloned().collect();
+    filtered
+}
+
+pub fn convert_mz_to_integer(data: &TimsTOFData) -> TimsTOFData {
+    let mut converted = TimsTOFData::new();
+    
+    converted.rt_values_min = data.rt_values_min.clone();
+    converted.mobility_values = data.mobility_values.clone();
+    converted.intensity_values = data.intensity_values.clone();
+    converted.frame_indices = data.frame_indices.clone();
+    converted.scan_indices = data.scan_indices.clone();
+    
+    converted.mz_values = data.mz_values.iter()
+        .map(|&mz| (mz * 1000.0).ceil())
+        .collect();
+    
+    converted
+}
+
+// ----------------------------- New functions from main.rs -----------------------------
+
+pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<dyn Error>> {
+    eprintln!("Reading library file: {}", file_path);
+    let file = File::open(file_path)?;
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(true)
+        .from_reader(file);
+    
+    let headers = reader.headers()?.clone();
+    let mut column_indices = HashMap::new();
+    for (i, header) in headers.iter().enumerate() {
+        column_indices.insert(header, i);
+    }
+    
+    // Get library column mapping
+    let lib_col_dict = get_lib_col_dict();
+    let mut mapped_indices: HashMap<&str, usize> = HashMap::new();
+    for (old_col, new_col) in &lib_col_dict {
+        if let Some(&idx) = column_indices.get(old_col) {
+            mapped_indices.insert(new_col, idx);
+        }
+    }
+    
+    let fragment_number_idx = column_indices.get("FragmentNumber").copied();
+    
+    // Read all records into memory first
+    let mut byte_records = Vec::new();
+    for result in reader.byte_records() {
+        byte_records.push(result?);
+    }
+    
+    eprintln!("Processing {} library records...", byte_records.len());
+    
+    // Process records in parallel
+    let records: Vec<LibraryRecord> = byte_records.par_iter().map(|record| {
+        let mut rec = LibraryRecord {
+            transition_group_id: String::new(),
+            peptide_sequence: String::new(),
+            full_unimod_peptide_name: String::new(),
+            precursor_charge: String::new(),
+            precursor_mz: String::new(),
+            tr_recalibrated: String::new(),
+            product_mz: String::new(),
+            fragment_type: String::new(),
+            fragment_charge: String::new(),
+            fragment_number: String::new(),
+            library_intensity: String::new(),
+            protein_id: String::new(),
+            protein_name: String::new(),
+            gene: String::new(),
+            decoy: "0".to_string(),
+            other_columns: HashMap::new(),
+        };
+        
+        // Fill fields from mapped columns
+        if let Some(&idx) = mapped_indices.get("PeptideSequence") { 
+            if let Some(val) = record.get(idx) { 
+                rec.peptide_sequence = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("FullUniModPeptideName") { 
+            if let Some(val) = record.get(idx) { 
+                rec.full_unimod_peptide_name = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("PrecursorCharge") { 
+            if let Some(val) = record.get(idx) { 
+                rec.precursor_charge = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("PrecursorMz") { 
+            if let Some(val) = record.get(idx) { 
+                rec.precursor_mz = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProductMz") { 
+            if let Some(val) = record.get(idx) { 
+                rec.product_mz = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("FragmentType") {
+            if let Some(val) = record.get(idx) {
+                let fragment_str = String::from_utf8_lossy(val);
+                rec.fragment_type = match fragment_str.as_ref() { 
+                    "b" => "1".to_string(), 
+                    "y" => "2".to_string(), 
+                    "p" => "3".to_string(), 
+                    _ => fragment_str.into_owned() 
+                };
+            }
+        }
+        if let Some(&idx) = mapped_indices.get("FragmentCharge") { 
+            if let Some(val) = record.get(idx) { 
+                rec.fragment_charge = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("LibraryIntensity") { 
+            if let Some(val) = record.get(idx) { 
+                rec.library_intensity = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("Tr_recalibrated") { 
+            if let Some(val) = record.get(idx) { 
+                rec.tr_recalibrated = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProteinID") { 
+            if let Some(val) = record.get(idx) { 
+                rec.protein_id = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("Gene") { 
+            if let Some(val) = record.get(idx) { 
+                rec.gene = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        if let Some(&idx) = mapped_indices.get("ProteinName") { 
+            if let Some(val) = record.get(idx) { 
+                rec.protein_name = String::from_utf8_lossy(val).into_owned(); 
+            } 
+        }
+        
+        if let Some(idx) = fragment_number_idx {
+            if let Some(val) = record.get(idx) {
+                rec.fragment_number = String::from_utf8_lossy(val).into_owned();
+            }
+        }
+        
+        // Generate transition_group_id
+        rec.transition_group_id = format!("{}{}", rec.full_unimod_peptide_name, rec.precursor_charge);
+        rec
+    }).collect();
+    
+    Ok(records)
+}
+
+pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>, HashMap<String, f64>)> {
+    let id_col = df.column("transition_group_id")?;
+    let id_vec = id_col.str()?.into_iter()
+        .map(|opt| opt.unwrap_or("").to_string())
+        .collect::<Vec<String>>();
+    
+    let rt_col = df.column("RT")?;
+    let rt_vec: Vec<f64> = match rt_col.dtype() {
+        DataType::Float32 => rt_col.f32()?.into_iter()
+            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .collect(),
+        DataType::Float64 => rt_col.f64()?.into_iter()
+            .map(|opt| opt.unwrap_or(f64::NAN))
+            .collect(),
+        _ => return Err(PolarsError::SchemaMismatch(
+            format!("RT column type is not float: {:?}", rt_col.dtype()).into()
+        )),
+    };
+    
+    let im_col = df.column("IM")?;
+    let im_vec: Vec<f64> = match im_col.dtype() {
+        DataType::Float32 => im_col.f32()?.into_iter()
+            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
+            .collect(),
+        DataType::Float64 => im_col.f64()?.into_iter()
+            .map(|opt| opt.unwrap_or(f64::NAN))
+            .collect(),
+        _ => return Err(PolarsError::SchemaMismatch(
+            format!("IM column type is not float: {:?}", im_col.dtype()).into()
+        )),
+    };
+    
+    let mut rt_dict = HashMap::new();
+    let mut im_dict = HashMap::new();
+    
+    for ((id, rt), im) in id_vec.iter().zip(rt_vec.iter()).zip(im_vec.iter()) {
+        rt_dict.insert(id.clone(), *rt);
+        im_dict.insert(id.clone(), *im);
+    }
+    
+    Ok((rt_dict, im_dict))
+}
+
+// ----------------------------- End of moved functions -----------------------------
 
 // Helper functions for MS data processing
 pub fn build_ms1_data(fragment_list: &[Vec<f64>], isotope_range: f64, max_mz: f64) -> MSDataArray {
@@ -872,225 +1452,4 @@ pub fn build_frag_info(
     }
     
     frag_info
-}
-
-// Functions moved from main.rs
-pub fn read_parquet_with_polars(file_path: &str) -> PolarsResult<DataFrame> {
-    let file = File::open(file_path)?;
-    let mut df = ParquetReader::new(file).finish()?;
-    let new_col = df.column("Precursor.Id")?.clone().with_name("transition_group_id");
-    df.with_column(new_col)?;
-    Ok(df)
-}
-
-pub fn library_records_to_dataframe(records: Vec<LibraryRecord>) -> PolarsResult<DataFrame> {
-    let mut transition_group_ids = Vec::with_capacity(records.len());
-    let mut precursor_mzs = Vec::with_capacity(records.len());
-    let mut product_mzs = Vec::with_capacity(records.len());
-    for record in records {
-        transition_group_ids.push(record.transition_group_id);
-        precursor_mzs.push(record.precursor_mz.parse::<f64>().unwrap_or(f64::NAN));
-        product_mzs.push(record.product_mz.parse::<f64>().unwrap_or(f64::NAN));
-    }
-    let df = DataFrame::new(vec![
-        Series::new("transition_group_id", transition_group_ids),
-        Series::new("PrecursorMz", precursor_mzs),
-        Series::new("ProductMz", product_mzs),
-    ])?;
-    Ok(df)
-}
-
-pub fn merge_library_and_report(library_df: DataFrame, report_df: DataFrame) -> PolarsResult<DataFrame> {
-    let report_selected = report_df.select(["transition_group_id", "RT", "IM", "iIM"])?;
-    let merged = library_df.join(&report_selected, ["transition_group_id"], ["transition_group_id"], JoinArgs::new(JoinType::Left))?;
-    let rt_col = merged.column("RT")?;
-    let mask = rt_col.is_not_null();
-    let filtered = merged.filter(&mask)?;
-    let reordered = filtered.select(["transition_group_id", "PrecursorMz", "ProductMz", "RT", "IM", "iIM"])?;
-    Ok(reordered)
-}
-
-pub fn get_unique_precursor_ids(diann_result: &DataFrame) -> PolarsResult<DataFrame> {
-    let unique_df = diann_result.unique(Some(&["transition_group_id".to_string()]), UniqueKeepStrategy::First, None)?;
-    let selected_df = unique_df.select(["transition_group_id", "RT", "IM"])?;
-    Ok(selected_df)
-}
-
-pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<dyn Error>> {
-    eprintln!("Reading library file: {}", file_path);
-    let file = File::open(file_path)?;
-    let mut reader = ReaderBuilder::new()
-        .delimiter(b'\t')
-        .has_headers(true)
-        .from_reader(file);
-    
-    let headers = reader.headers()?.clone();
-    let mut column_indices = HashMap::new();
-    for (i, header) in headers.iter().enumerate() {
-        column_indices.insert(header, i);
-    }
-    
-    // Get library column mapping
-    let lib_col_dict = get_lib_col_dict();
-    let mut mapped_indices: HashMap<&str, usize> = HashMap::new();
-    for (old_col, new_col) in &lib_col_dict {
-        if let Some(&idx) = column_indices.get(old_col) {
-            mapped_indices.insert(new_col, idx);
-        }
-    }
-    
-    let fragment_number_idx = column_indices.get("FragmentNumber").copied();
-    
-    // Read all records into memory first
-    let mut byte_records = Vec::new();
-    for result in reader.byte_records() {
-        byte_records.push(result?);
-    }
-    
-    eprintln!("Processing {} library records...", byte_records.len());
-    
-    // Process records in parallel
-    let records: Vec<LibraryRecord> = byte_records.par_iter().map(|record| {
-        let mut rec = LibraryRecord {
-            transition_group_id: String::new(),
-            peptide_sequence: String::new(),
-            full_unimod_peptide_name: String::new(),
-            precursor_charge: String::new(),
-            precursor_mz: String::new(),
-            tr_recalibrated: String::new(),
-            product_mz: String::new(),
-            fragment_type: String::new(),
-            fragment_charge: String::new(),
-            fragment_number: String::new(),
-            library_intensity: String::new(),
-            protein_id: String::new(),
-            protein_name: String::new(),
-            gene: String::new(),
-            decoy: "0".to_string(),
-            other_columns: HashMap::new(),
-        };
-        
-        // Fill fields from mapped columns
-        if let Some(&idx) = mapped_indices.get("PeptideSequence") { 
-            if let Some(val) = record.get(idx) { 
-                rec.peptide_sequence = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("FullUniModPeptideName") { 
-            if let Some(val) = record.get(idx) { 
-                rec.full_unimod_peptide_name = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("PrecursorCharge") { 
-            if let Some(val) = record.get(idx) { 
-                rec.precursor_charge = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("PrecursorMz") { 
-            if let Some(val) = record.get(idx) { 
-                rec.precursor_mz = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("ProductMz") { 
-            if let Some(val) = record.get(idx) { 
-                rec.product_mz = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("FragmentType") {
-            if let Some(val) = record.get(idx) {
-                let fragment_str = String::from_utf8_lossy(val);
-                rec.fragment_type = match fragment_str.as_ref() { 
-                    "b" => "1".to_string(), 
-                    "y" => "2".to_string(), 
-                    "p" => "3".to_string(), 
-                    _ => fragment_str.into_owned() 
-                };
-            }
-        }
-        if let Some(&idx) = mapped_indices.get("FragmentCharge") { 
-            if let Some(val) = record.get(idx) { 
-                rec.fragment_charge = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("LibraryIntensity") { 
-            if let Some(val) = record.get(idx) { 
-                rec.library_intensity = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("Tr_recalibrated") { 
-            if let Some(val) = record.get(idx) { 
-                rec.tr_recalibrated = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("ProteinID") { 
-            if let Some(val) = record.get(idx) { 
-                rec.protein_id = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("Gene") { 
-            if let Some(val) = record.get(idx) { 
-                rec.gene = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        if let Some(&idx) = mapped_indices.get("ProteinName") { 
-            if let Some(val) = record.get(idx) { 
-                rec.protein_name = String::from_utf8_lossy(val).into_owned(); 
-            } 
-        }
-        
-        if let Some(idx) = fragment_number_idx {
-            if let Some(val) = record.get(idx) {
-                rec.fragment_number = String::from_utf8_lossy(val).into_owned();
-            }
-        }
-        
-        // Generate transition_group_id
-        rec.transition_group_id = format!("{}{}", rec.full_unimod_peptide_name, rec.precursor_charge);
-        rec
-    }).collect();
-    
-    Ok(records)
-}
-
-pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f64>, HashMap<String, f64>)> {
-    let id_col = df.column("transition_group_id")?;
-    let id_vec = id_col.str()?.into_iter()
-        .map(|opt| opt.unwrap_or("").to_string())
-        .collect::<Vec<String>>();
-    
-    let rt_col = df.column("RT")?;
-    let rt_vec: Vec<f64> = match rt_col.dtype() {
-        DataType::Float32 => rt_col.f32()?.into_iter()
-            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
-            .collect(),
-        DataType::Float64 => rt_col.f64()?.into_iter()
-            .map(|opt| opt.unwrap_or(f64::NAN))
-            .collect(),
-        _ => return Err(PolarsError::SchemaMismatch(
-            format!("RT column type is not float: {:?}", rt_col.dtype()).into()
-        )),
-    };
-    
-    let im_col = df.column("IM")?;
-    let im_vec: Vec<f64> = match im_col.dtype() {
-        DataType::Float32 => im_col.f32()?.into_iter()
-            .map(|opt| opt.map(|v| v as f64).unwrap_or(f64::NAN))
-            .collect(),
-        DataType::Float64 => im_col.f64()?.into_iter()
-            .map(|opt| opt.unwrap_or(f64::NAN))
-            .collect(),
-        _ => return Err(PolarsError::SchemaMismatch(
-            format!("IM column type is not float: {:?}", im_col.dtype()).into()
-        )),
-    };
-    
-    let mut rt_dict = HashMap::new();
-    let mut im_dict = HashMap::new();
-    
-    for ((id, rt), im) in id_vec.iter().zip(rt_vec.iter()).zip(im_vec.iter()) {
-        rt_dict.insert(id.clone(), *rt);
-        im_dict.insert(id.clone(), *im);
-    }
-    
-    Ok((rt_dict, im_dict))
 }
